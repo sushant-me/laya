@@ -28,7 +28,13 @@ if [ ! -d ".venv" ]; then
     echo "  Created venv"
 fi
 source .venv/bin/activate
-pip install -q -r requirements.txt
+# Install the dev requirements, not requirements.txt: the latter is what ships
+# to users (bundle-engine.sh copies it and the app builds its venv from it), so
+# it deliberately excludes the test runner. requirements-dev.txt pulls in
+# requirements.txt and adds pytest + pytest-asyncio, which CONTRIBUTING.md
+# assumes are present when it tells you to run `pytest`. Without this the
+# documented testing step fails with "pytest: command not found".
+pip install -q -r requirements-dev.txt
 echo "  Python deps installed"
 
 # Node dependencies

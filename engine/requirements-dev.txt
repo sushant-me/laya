@@ -1,0 +1,37 @@
+# Laya Engine — development and test dependencies
+#
+# Install this, not `requirements.txt`, when you are working on the engine:
+#
+#     pip install -r requirements-dev.txt
+#
+# Why this file exists
+# --------------------
+# `CONTRIBUTING.md` tells contributors to run `pytest` from the venv that
+# `scripts/setup-dev.sh` creates, and `.github/PULL_REQUEST_TEMPLATE.md` asks
+# them to confirm the tests pass. Neither `pytest` nor `pytest-asyncio` was in
+# `requirements.txt`, so that venv had no test runner at all:
+#
+#     $ scripts/setup-dev.sh
+#     $ cd engine && source .venv/bin/activate
+#     $ pytest
+#     bash: pytest: command not found
+#
+# The test suite imports `pytest` in 77 files and `pytest_asyncio` in 7 — the
+# async fixtures in `engine/tests/conftest.py` do not work without the latter —
+# so these are the only two dependencies the suite needs that `requirements.txt`
+# does not already provide.
+#
+# Why they are not simply added to `requirements.txt`
+# --------------------------------------------------
+# `scripts/bundle-engine.sh` copies `requirements.txt` into the shipped app and
+# the user's engine venv is created from it at first run. Test tooling belongs
+# in neither, so the runtime requirements stay as they are and this file is the
+# development-only layer on top of them.
+#
+# `-r requirements.txt` below keeps the two in sync: installing this file always
+# gives you the full runtime set plus the test runner.
+
+-r requirements.txt
+
+pytest>=8.0.0
+pytest-asyncio>=1.0.0

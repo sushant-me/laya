@@ -87,6 +87,15 @@ Write clear, concise commit messages:
 
 ### Backend
 
+The test runner is not part of `requirements.txt` — that file is what ships to
+users — so it lives in `engine/requirements-dev.txt`. `scripts/setup-dev.sh`
+installs it; if you built the venv by hand, or created it before that file
+existed, install it once:
+
+```bash
+cd engine && source .venv/bin/activate && pip install -r requirements-dev.txt
+```
+
 ```bash
 cd engine && source .venv/bin/activate
 
