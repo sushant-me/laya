@@ -3,16 +3,40 @@
 
 """Shared test fixtures for Laya Engine tests."""
 
+import atexit
 import json
+import os
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import aiosqlite
-import pytest
-import pytest_asyncio
+# ---------------------------------------------------------------------------
+# Keep the suite out of the developer's real ~/.laya
+#
+# ``laya/config.py`` resolves ``LAYA_HOME`` from ``Path.home()`` at *import*
+# time, and the fixtures below call ``load_settings()`` / ``save_settings()`` and
+# ``delete_mcp_token()``. Those reach the real config directory, so a plain
+# ``pytest`` run rewrites ``~/.laya/settings.json`` and deletes the developer's
+# MCP bearer token from the OS keychain — which reads as "my token stopped
+# working" to anyone who was using Laya before running the tests.
+#
+# This must happen before the first ``laya`` import: once ``config`` is imported
+# its constants are already bound to the real paths, and patching them after the
+# fact would miss every module that did ``from laya.config import LAYA_...``.
+# ``HOME`` covers POSIX, ``USERPROFILE`` covers Windows — ``Path.home()`` reads
+# one or the other, so both are set rather than leaving the platform to chance.
+_TEST_HOME = tempfile.mkdtemp(prefix="laya-test-home-")
+os.environ["HOME"] = _TEST_HOME
+os.environ["USERPROFILE"] = _TEST_HOME
+atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
 
-from laya.config import MIGRATIONS_DIR
-from laya.db.migrate import run_migrations
+import aiosqlite  # noqa: E402
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+
+from laya.config import LAYA_HOME, MIGRATIONS_DIR  # noqa: E402
+from laya.db.migrate import run_migrations  # noqa: E402
 from laya.models.classification import Persona, RouterOutput
 from laya.models.event import LayaEvent
 from laya.models.rules import RulesConfig
