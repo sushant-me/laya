@@ -37,6 +37,9 @@ PROMPT_FILES: dict[str, str] = {
     "chat": "chat.md",
     "chat_title": "chat_title.md",
     "chat_polish": "chat_polish.md",
+    # Opt-in chat focus (persona) blocks, one file per focus id in
+    # prompts.chat.CHAT_FOCUS_PROMPTS (e.g. "coding" -> chat_focus_coding.md).
+    "chat_focus_coding": "chat_focus_coding.md",
     "learner": "learner.md",
     "context_learner": "context_learner.md",
     "trace_narrative": "trace_narrative.md",

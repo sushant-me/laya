@@ -15,6 +15,12 @@
 	import { parseBackendDate } from '$lib/utils/datetime';
 	import { glassTheme } from '$lib/stores/glassTheme';
 
+	// The list is shared by the chat sidebar and the full-page /chat rail. Only
+	// the sidebar has a window to expand/close, so those two controls are
+	// opt-out: on the page they would toggle sidebar state that isn't rendered
+	// (dead buttons). Default true keeps the sidebar byte-identical.
+	let { showWindowControls = true }: { showWindowControls?: boolean } = $props();
+
 	let loading = $state(true);
 	let deletingId = $state<string | null>(null);
 	let editingId = $state<string | null>(null);
@@ -177,37 +183,39 @@
 					<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
 				</svg>
 			</button>
-			<!-- Expand / collapse the wide overlay -->
-			<div class="group/exp relative">
+			<!-- Expand / collapse the wide overlay (sidebar only — see showWindowControls) -->
+			{#if showWindowControls}
+				<div class="group/exp relative">
+					<button
+						onclick={() => chatExpanded.set(!$chatExpanded)}
+						aria-label={$chatExpanded ? 'Collapse chat' : 'Expand chat'}
+						class="rounded-md p-1 text-surface-400 transition-colors {$glassTheme ? 'glass-hover' : 'hover:bg-surface-800'} hover:text-laya-orange"
+					>
+						{#if $chatExpanded}
+							<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 9h5V4M20 9h-5V4M4 15h5v5M20 15h-5v5" />
+							</svg>
+						{:else}
+							<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" />
+							</svg>
+						{/if}
+					</button>
+					<span class="pointer-events-none absolute right-0 top-full z-10 mt-1 whitespace-nowrap rounded-md border border-transparent glass-tooltip glass-tooltip-dense px-2 py-1 text-[10px] font-medium shadow-lg opacity-0 transition-opacity duration-75 group-hover/exp:opacity-100">
+						{$chatExpanded ? 'Collapse' : 'Expand'}
+					</span>
+				</div>
+				<!-- Close -->
 				<button
-					onclick={() => chatExpanded.set(!$chatExpanded)}
-					aria-label={$chatExpanded ? 'Collapse chat' : 'Expand chat'}
-					class="rounded-md p-1 text-surface-400 transition-colors {$glassTheme ? 'glass-hover' : 'hover:bg-surface-800'} hover:text-laya-orange"
+					onclick={() => chatOpen.set(false)}
+					aria-label="Close chat"
+					class="rounded-md p-1 text-surface-400 transition-colors hover:text-surface-200"
 				>
-					{#if $chatExpanded}
-						<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 9h5V4M20 9h-5V4M4 15h5v5M20 15h-5v5" />
-						</svg>
-					{:else}
-						<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" />
-						</svg>
-					{/if}
+					<svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+					</svg>
 				</button>
-				<span class="pointer-events-none absolute right-0 top-full z-10 mt-1 whitespace-nowrap rounded-md border border-transparent glass-tooltip glass-tooltip-dense px-2 py-1 text-[10px] font-medium shadow-lg opacity-0 transition-opacity duration-75 group-hover/exp:opacity-100">
-					{$chatExpanded ? 'Collapse' : 'Expand'}
-				</span>
-			</div>
-			<!-- Close -->
-			<button
-				onclick={() => chatOpen.set(false)}
-				aria-label="Close chat"
-				class="rounded-md p-1 text-surface-400 transition-colors hover:text-surface-200"
-			>
-				<svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-					<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-				</svg>
-			</button>
+			{/if}
 		</div>
 	</div>
 

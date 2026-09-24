@@ -153,12 +153,46 @@ runaway execution.
 - Confirm the rule details with the user before creating."""
 
 
+# Opt-in assistant focuses (personas), selected per request by the client via
+# ChatRequest.focus. Deliberately a fixed map rather than free text: the focus
+# string arrives from the client and is appended to the SYSTEM prompt, so an
+# arbitrary value would be an unauthenticated prompt-injection channel that
+# also survives every later turn of the conversation. An unknown id is ignored
+# (base behaviour) — see build_chat_messages.
+CHAT_FOCUS_PROMPTS: dict[str, str] = {
+    "coding": """\
+## Focus: Coding
+
+This session is a coding workspace. The user's questions are about software \
+engineering unless they clearly say otherwise.
+
+- Optimize answers for implementable engineering work: code, commands, diffs, \
+configuration, debugging, and architecture.
+- Prefer concrete artifacts over prose. Show the code, the exact command, or \
+the precise file/line change. Keep explanations short and adjacent to the code.
+- Always use fenced code blocks with the language tag.
+- When the user's request is ambiguous, state the assumption you are making in \
+one line and answer it — do not stall on a clarifying question unless the \
+request genuinely cannot be answered without one.
+- Be precise about versions, flags, APIs, and error text. Never invent an API, \
+flag, or library method; if you are unsure, say so and describe how to check.
+- When describing a change, say what breaks if the change is not made and how \
+to verify it.
+- Reference the user's own cards, events, and threads when they are relevant to \
+the engineering problem — that surrounding work context is the point of this \
+assistant being here.
+- Out-of-scope requests are still answered normally; this focus tunes how you \
+answer, it does not restrict what you will answer.""",
+}
+
+
 def build_chat_messages(
     user_message: str,
     chat_history: list[dict[str, str]],
     context_text: str = "",
     user_identity: dict[str, str] | None = None,
     card_context: str | None = None,
+    focus: str | None = None,
 ) -> list[dict[str, str]]:
     """Build the messages array for the Chat LLM call.
 
@@ -168,8 +202,28 @@ def build_chat_messages(
         context_text: Pre-packed context string from hybrid retrieval.
         user_identity: Optional dict with 'name' and 'email' of the Laya user.
         card_context: Optional card context injected as system prompt (used by Omni card view).
+        focus: Optional opt-in assistant focus id (see CHAT_FOCUS_PROMPTS). None —
+            the default for every existing caller — leaves the prompt untouched;
+            an unrecognized id is ignored rather than injected.
     """
     system_content = get_prompt("chat", CHAT_SYSTEM_PROMPT)
+
+    # Opt-in focus block. Appended after the base prompt so it can tune tone and
+    # output shape, and before card/identity context so those stay last (closest
+    # to the user turn) and keep winning on specifics.
+    #
+    # `isinstance(focus, str)` guards the map lookup: a non-string (possible from
+    # the WebSocket payload) would raise "unhashable type" for a list/dict. The
+    # WS router already drops non-strings; this keeps the prompt assembly safe
+    # for every caller.
+    focus_block = CHAT_FOCUS_PROMPTS.get(focus) if isinstance(focus, str) and focus else None
+    if focus_block:
+        # Route the focus block through the prompt-override loader, like every
+        # other stage prompt (see README "Custom Prompts"): the fixed map stays
+        # the allowlist of valid ids, while the text for a known id can be
+        # replaced from ~/.laya/prompts/chat_focus_<id>.md.
+        focus_block = get_prompt(f"chat_focus_{focus}", focus_block)
+        system_content += f"\n\n{focus_block}"
 
     # Inject card context into system prompt so the LLM has full awareness
     # of the card being discussed without the user needing to re-state it.

@@ -45,6 +45,7 @@ async def send_chat_message(body: ChatRequest) -> ChatResponse:
             conversation_id=body.conversation_id,
             card_context=body.card_context,
             card_ids=body.card_ids,
+            focus=body.focus,
         )
         return response
     except Exception as e:

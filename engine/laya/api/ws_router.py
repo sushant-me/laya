@@ -177,6 +177,16 @@ async def _handle_chat_message(msg: dict) -> None:
     conversation_id = payload.get("conversation_id")
     card_context = payload.get("card_context")
     card_ids = payload.get("card_ids")
+    # Opt-in assistant focus (e.g. "coding") — resolved against a fixed map in
+    # prompts.chat; unknown ids are ignored so this can't inject prompt text.
+    # JSON gives no type guarantee, and the map lookup is a dict `.get`, so a
+    # list/dict here raises "unhashable type" deep inside prompt assembly and
+    # aborts the whole turn. Validate the boundary: a non-string focus is
+    # dropped (None = no focus) rather than raising.
+    focus = payload.get("focus")
+    if focus is not None and not isinstance(focus, str):
+        log.warning("ws_chat_focus_not_string", focus_type=type(focus).__name__)
+        focus = None
 
     if not message.strip():
         log.warning("ws_chat_empty_message")
@@ -192,6 +202,7 @@ async def _handle_chat_message(msg: dict) -> None:
             conversation_id=conversation_id,
             card_context=card_context,
             card_ids=card_ids,
+            focus=focus,
         ):
             await manager.broadcast(event)
 

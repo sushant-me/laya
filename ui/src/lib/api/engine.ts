@@ -550,14 +550,24 @@ export const engineApi = {
 		const qs = params.toString();
 		return request<ChatMessage[]>(`/chat/history${qs ? '?' + qs : ''}`);
 	},
-	sendChat: (message: string, conversationId?: string, cardContext?: string, cardIds?: string[]) =>
+	sendChat: (
+		message: string,
+		conversationId?: string,
+		cardContext?: string,
+		cardIds?: string[],
+		// Opt-in assistant focus (persona) id, e.g. 'coding'. Resolved server-side
+		// against a fixed map; omitted entirely when unset so existing callers'
+		// requests are byte-identical to before.
+		focus?: string
+	) =>
 		request<ChatResponse>('/chat', {
 			method: 'POST',
 			body: JSON.stringify({
 				message,
 				conversation_id: conversationId ?? null,
 				...(cardContext ? { card_context: cardContext } : {}),
-				...(cardIds && cardIds.length > 0 ? { card_ids: cardIds } : {})
+				...(cardIds && cardIds.length > 0 ? { card_ids: cardIds } : {}),
+				...(focus ? { focus } : {})
 			})
 		}),
 

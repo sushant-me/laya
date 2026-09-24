@@ -27,6 +27,10 @@ class ChatRequest(BaseModel):
     # the client passes the card IDs so the conversation can be tagged and
     # re-opened when the user returns to the same view.
     card_ids: list[str] | None = None
+    # Opt-in assistant focus (persona) id, e.g. "coding" — resolved server-side
+    # against prompts.chat.CHAT_FOCUS_PROMPTS. Omitted by every existing caller;
+    # an unknown id is ignored, so this can never inject prompt text.
+    focus: str | None = None
 
 
 class ChatResponse(BaseModel):

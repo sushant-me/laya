@@ -18,9 +18,9 @@
 		chatCardIds
 	} from '$lib/stores/chat';
 	import { applyLoadedMessages } from '$lib/stores/chatStream';
-	import { wsStatus, sendMessage } from '$lib/stores/websocket';
+	import { sendChatMessage } from '$lib/chat/send';
+	import { resolveComposerAction, shouldClearAfterSend } from '$lib/chat/composer';
 	import { engineApi } from '$lib/api/engine';
-	import type { ChatMessage as ChatMessageType } from '$lib/api/types';
 	import ChatMessage from './ChatMessage.svelte';
 	import ChatConversationList from './ChatConversationList.svelte';
 	import { fly, fade } from 'svelte/transition';
@@ -190,73 +190,43 @@
 	// chunk of a still-running chat and making it look aborted on reopen.
 
 	async function send() {
-		const text = input.trim();
-		if (!text || chatBusy) return;
-
-		const convId = get(activeConversationId);
-
-		const userMsg: ChatMessageType = {
-			message_id: `tmp-${Date.now()}`,
-			timestamp: new Date().toISOString(),
-			role: 'user',
-			content: text,
-			referenced_cards: [],
-			referenced_events: [],
-			conversation_id: convId ?? undefined
-		};
-		chatMessages.update((msgs) => [...msgs, userMsg]);
-		input = '';
-		chatSending.set(true);
+		// The send itself (optimistic bubble, WS-first with REST fallback, error
+		// bubble) lives in $lib/chat/send.ts so the full-page /chat route reuses
+		// exactly this behaviour instead of keeping a second copy that drifts.
+		//
+		// Clear only what this send actually dispatched, and only while the input
+		// still holds it: on the WS-down fallback sendChatMessage awaits the whole
+		// REST round trip, and this textarea is not disabled while busy, so an
+		// unconditional clear wiped text typed during a slow reply.
+		const text = input;
+		const dispatched = await sendChatMessage(text);
+		if (shouldClearAfterSend(text, input, dispatched)) input = '';
 		pinnedToBottom = true;
-
-		// Try WS first, fallback to REST
-		let wsConnected = false;
-		const unsub = wsStatus.subscribe((s) => (wsConnected = s === 'connected'));
-		unsub();
-
-		if (wsConnected) {
-			sendMessage({
-				type: 'chat_message',
-				payload: {
-					message: text,
-					conversation_id: convId,
-					...(get(chatCardContext) ? { card_context: get(chatCardContext) } : {}),
-					...(get(chatCardIds)?.length ? { card_ids: get(chatCardIds) } : {})
-				}
-			});
-		} else {
-			try {
-				const resp = await engineApi.sendChat(
-					text,
-					convId ?? undefined,
-					get(chatCardContext) ?? undefined,
-					get(chatCardIds) ?? undefined
-				);
-				chatMessages.update((msgs) => [...msgs, resp.message]);
-				// Track auto-created conversation
-				if (resp.message.conversation_id && !convId) {
-					activeConversationId.set(resp.message.conversation_id);
-				}
-			} catch {
-				const errMsg: ChatMessageType = {
-					message_id: `err-${Date.now()}`,
-					timestamp: new Date().toISOString(),
-					role: 'assistant',
-					content: 'Failed to send message. Please try again.',
-					referenced_cards: [],
-					referenced_events: []
-				};
-				chatMessages.update((msgs) => [...msgs, errMsg]);
-			} finally {
-				chatSending.set(false);
-			}
-		}
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
-		if (e.key === 'Enter' && !e.shiftKey) {
-			e.preventDefault();
-			send();
+		// Same decision table as the full-page composer, so an Enter pressed while
+		// an IME composition is open confirms the candidate instead of sending the
+		// half-composed text — and Enter while busy/empty is still swallowed
+		// rather than inserting a stray newline.
+		switch (
+			resolveComposerAction({
+				key: e.key,
+				shiftKey: e.shiftKey,
+				isComposing: e.isComposing,
+				busy: chatBusy,
+				hasText: input.trim().length > 0
+			})
+		) {
+			case 'send':
+				e.preventDefault();
+				void send();
+				break;
+			case 'block':
+				e.preventDefault();
+				break;
+			default:
+				break;
 		}
 	}
 
@@ -528,6 +498,17 @@
 
 			<!-- Input -->
 			<div class="border-t {$glassTheme ? 'border-white/[0.06]' : 'border-surface-700'} p-4">
+				<!-- Card context IS attached to this surface's sends, so say so right
+				     where the message is composed: the header's "Chat about this card"
+				     is at the top of a long conversation, and a card context that rides
+				     along invisibly is exactly the surprise this label prevents. The
+				     full-page /chat attaches none (see $lib/chat/send.ts). -->
+				{#if inCardMode}
+					<p class="mb-1.5 flex items-center gap-1.5 text-laya-micro text-laya-orange/80">
+						<span class="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-laya-orange"></span>
+						Card context attached: {$chatCardIds?.length === 1 ? 'this card' : `${$chatCardIds?.length} cards`}
+					</p>
+				{/if}
 				<div class="relative">
 					<textarea
 						bind:this={textareaEl}

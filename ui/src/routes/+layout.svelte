@@ -566,6 +566,13 @@
 									? 'bg-laya-orange/10 text-laya-orange'
 									: 'text-surface-400 hover:text-surface-200 hover:bg-surface-700'}"
 						>Coherence<sup class="text-[7px] ml-0.5 opacity-60 tracking-wider">BETA</sup></a>
+						<a
+							href="/chat"
+							class="whitespace-nowrap px-4 py-1.5 text-xs font-medium transition-colors
+								{page.url.pathname.startsWith('/chat')
+									? 'bg-laya-orange/10 text-laya-orange'
+									: 'text-surface-400 hover:text-surface-200 hover:bg-surface-700'}"
+						>Chat</a>
 					</nav>
 				{/if}
 			</div>
@@ -593,6 +600,13 @@
 							? 'bg-laya-orange/10 text-laya-orange'
 							: 'text-surface-400 hover:text-surface-200 hover:bg-surface-800'}"
 				>Coherence<sup class="text-[7px] ml-0.5 opacity-60 tracking-wider">BETA</sup></a>
+				<a
+					href="/chat"
+					class="rounded-md px-2.5 py-1 text-xs font-medium transition-colors
+						{page.url.pathname.startsWith('/chat')
+							? 'bg-laya-orange/10 text-laya-orange'
+							: 'text-surface-400 hover:text-surface-200 hover:bg-surface-800'}"
+				>Chat</a>
 			</nav>
 		{/if}
 	{/snippet}

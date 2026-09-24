@@ -50,7 +50,7 @@ Event Sources → n8n (port 45678) → Engine (port 8420) → UI (Tauri + Svelte
 
 **Three layers:**
 - **Engine** (`engine/laya/`): Python FastAPI backend. Pipeline processes events through `ingest → space_resolution → rules → router → workers → stager → emit` with post-emit async steps (see below). LLM calls go through LiteLLM (`llm/client.py`), which can also drive installed CLI coding agents (Claude Code, Codex, Gemini, Pi) as inference backends via `llm/agent_backend.py` (model-id form `agent/<id>/<model>`). ~27 API routers in `api/` — the large card surface is split into `cards_common` (shared row→model helpers) + route modules (`cards_feed`/`cards_lifecycle`/`cards_readstate`/`cards_payload`/`cards_agent`/`cards_groups`), aggregated in-place via `include_router` into one `cards_router` (order matters: `/cards/grouped` before `/cards/{card_id}`; P7-6). Pydantic models in `models/`. Async throughout (aiosqlite, httpx).
-- **UI** (`ui/src/`): SvelteKit frontend using Svelte 5 runes (`$state`, `$derived`, `$effect`, `$props`). Skeleton UI v4 + Tailwind CSS v4. Static adapter (SPA mode). Key routes: feed, coherence, dashboard, settings, workspace, omni, setup, status, legal.
+- **UI** (`ui/src/`): SvelteKit frontend using Svelte 5 runes (`$state`, `$derived`, `$effect`, `$props`). Skeleton UI v4 + Tailwind CSS v4. Static adapter (SPA mode). Key routes: feed, coherence, dashboard, settings, workspace, omni, chat, setup, status, legal.
 - **Tauri Shell** (`ui/src-tauri/`): Rust process that manages engine and n8n lifecycle (`sidecar.rs`, `n8n.rs`), tray icon, and native APIs.
 
 **Pipeline flow** (`engine/laya/pipeline/`):

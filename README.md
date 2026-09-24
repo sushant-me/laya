@@ -56,7 +56,7 @@ Your Tools (Jira, Slack, Gmail, Bitbucket, Calendar)
 - **Daily Briefing:** Morning summary of overnight activity, pending cards, and today's calendar with context
 - **Analytics Dashboard:** Track events processed, time saved, LLM costs (broken down by feature and pipeline step), throughput over time, and approval rates
 - **Budget Tracking:** Monitor LLM costs by feature (Pulse, Omni, Chat, Coherence) with monthly caps and automatic pause when limits are reached. When running on agent inference backends, a separate window-based usage budget pauses ingestion as an agent's rolling quota nears its limit and auto-resumes when the window resets
-- **Chat sidebar:** Ask Laya questions about your events, projects, and context — and create, edit, or delete filter/classification/processing rules directly from the conversation
+- **Chat:** Ask Laya questions about your events, projects, and context — and create, edit, or delete filter/classification/processing rules directly from the conversation. Available as a docked sidebar on any page and as a full-page coding workspace at `/chat` (a centred conversation with an opt-in coding persona)
 - **Hybrid search:** Chat and Coherence retrieval combine local vector search (ChromaDB) with lexical BM25 ranking over SQLite FTS5 (`cards_fts`/`events_fts`), merged via Reciprocal Rank Fusion, so both semantic and exact-keyword matches surface
 - **Coherence:** Cross-platform entity search traces any person, ticket, or PR across all platforms using hybrid local search, with AI-generated narratives
 - **Egress:** Execute outbound actions (emails, Slack messages, PR comments) directly from Laya with preview-before-send
@@ -279,7 +279,9 @@ vim ~/.laya/prompts/engineer.md
 curl -X POST http://127.0.0.1:8420/prompts/reload
 ```
 
-Available prompt files: `router.md`, `stager.md`, `omni.md`, `group_summary_initial.md`, `group_summary_rolling.md`, `briefing.md`, `summarizer.md`, `summarizer_status_change.md`, `engineer.md`, `comms.md`, `sales.md`, `hr.md`, `ops.md`, `finance.md`, `chat.md`, `chat_title.md`, `chat_polish.md`, `learner.md`, `context_learner.md`, `trace_narrative.md`, `trace_summary.md`, `trace_filter.md`.
+Available prompt files: `router.md`, `stager.md`, `omni.md`, `group_summary_initial.md`, `group_summary_rolling.md`, `briefing.md`, `summarizer.md`, `summarizer_status_change.md`, `engineer.md`, `comms.md`, `sales.md`, `hr.md`, `ops.md`, `finance.md`, `chat.md`, `chat_title.md`, `chat_polish.md`, `chat_focus_coding.md`, `learner.md`, `context_learner.md`, `trace_narrative.md`, `trace_summary.md`, `trace_filter.md`.
+
+`chat_focus_<id>.md` overrides the opt-in chat focus (persona) block for a focus id the client requested — currently only `chat_focus_coding.md`, the coding persona behind the `/chat` page. The set of valid focus ids is a fixed server-side allowlist, so an override only replaces the text of a known persona; it can never add one.
 
 Custom prompts fully replace the built-in default for that stage. If a file is deleted, the hardcoded default is used automatically. The engine never creates or modifies files in this directory. Use `GET /prompts` to check which prompts are currently overridden.
 

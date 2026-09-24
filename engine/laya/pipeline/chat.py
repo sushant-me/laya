@@ -263,6 +263,7 @@ async def process_chat_message(
     conversation_id: str | None = None,
     card_context: str | None = None,
     card_ids: list[str] | None = None,
+    focus: str | None = None,
 ) -> ChatResponse:
     """Process a user chat message through the enhanced pipeline.
 
@@ -321,6 +322,7 @@ async def process_chat_message(
         context_text=context["context_text"],
         user_identity=user_identity,
         card_context=card_context,
+        focus=focus,
     )
 
     # Intent-gated toolset: read + card-write always; settings/rules/egress only
@@ -531,6 +533,7 @@ async def process_chat_message_streaming(
     conversation_id: str | None = None,
     card_context: str | None = None,
     card_ids: list[str] | None = None,
+    focus: str | None = None,
 ):
     """Streaming version of process_chat_message.
 
@@ -582,6 +585,7 @@ async def process_chat_message_streaming(
         context_text=context["context_text"],
         user_identity=user_identity,
         card_context=card_context,
+        focus=focus,
     )
 
     # Intent-gated toolset: read + card-write always; settings/rules/egress only
