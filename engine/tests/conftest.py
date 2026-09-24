@@ -3,49 +3,202 @@
 
 """Shared test fixtures for Laya Engine tests."""
 
+import atexit
 import json
 import os
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
-# Keep the suite out of the developer's real ~/.laya
+# Keep the suite out of the developer's real ~/.laya AND their real keychain
 #
-# ``laya/config.py`` resolves ``LAYA_HOME`` from ``Path.home()`` at *import*
-# time, and the fixtures below call ``load_settings()`` / ``save_settings()`` and
-# ``delete_mcp_token()``. Those reach the real config directory, so a plain
-# ``pytest`` run rewrites ``~/.laya/settings.json`` and deletes the developer's
-# MCP bearer token from the OS keychain — which reads as "my token stopped
-# working" to anyone who was using Laya before running the tests.
+# Two pieces of user state are reachable from a plain ``pytest`` run, and they
+# need two different defences because they do not live in the same place:
 #
-# This must happen before the first ``laya`` import: once ``config`` is imported
-# its constants are already bound to the real paths, and patching them after the
-# fact would miss every module that did ``from laya.config import LAYA_...``.
-# ``HOME`` covers POSIX, ``USERPROFILE`` covers Windows — ``Path.home()`` reads
-# one or the other, so both are set rather than leaving the platform to chance.
-# A FIXED path, reused across runs, not a fresh mkdtemp each time. Redirecting
-# HOME also relocates every cache underneath it, and ChromaDB's embedding model
-# lives in one -- so a throwaway directory made test_chromadb re-download the
-# model on every single run, taking the suite from 43s to 241s. Reusing the
-# directory keeps the cache warm while still keeping the suite out of the real
-# ~/.laya, which is the only property that matters here. Test state is not a
-# concern: the DB fixtures are in-memory and settings are restored per test.
-_TEST_HOME = os.path.join(tempfile.gettempdir(), "laya-test-home")
-os.makedirs(_TEST_HOME, exist_ok=True)
+#   1. ``laya/config.py`` resolves ``LAYA_HOME`` from ``Path.home()`` at *import*
+#      time, and the fixtures below call ``load_settings()`` / ``save_settings()``.
+#      Redirecting ``HOME`` (and ``USERPROFILE`` — ``Path.home()`` reads one or
+#      the other) moves those paths, and it must happen before the first ``laya``
+#      import: once ``config`` is imported its constants are bound to the real
+#      paths, and patching them afterwards would miss every module that did
+#      ``from laya.config import LAYA_...``.
+#
+#   2. The OS keychain is NOT under ``HOME``, so the redirect above does not
+#      reach it. ``laya/security/keychain.py`` calls
+#      ``keyring.set_password(SERVICE_NAME, ...)``, which talks to a per-user
+#      daemon (SecretService on Linux, Keychain on macOS, Credential Locker on
+#      Windows). The fixtures that call ``delete_mcp_token()`` therefore deleted
+#      the developer's real MCP bearer token anyway — which presents as "my token
+#      stopped working" to anyone who had Laya running before they ran the tests.
+#      ``keyring.set_keyring`` swaps the process-global backend instead, so the
+#      whole suite gets an in-memory store that dies with the process.
+#
+# The test directory is a FIXED path, reused across runs, not a fresh mkdtemp:
+# redirecting HOME also relocates every cache underneath it, and ChromaDB's
+# embedding model lives in one — so a throwaway directory made test_chromadb
+# re-download the model on every run, taking the suite from 43s to 241s. Reusing
+# it keeps that cache warm, which is the only reason it is fixed at all. Because
+# a predictable name in a shared temp directory can be prepared by someone else,
+# it is uid-suffixed, created 0o700, and its owner/mode/type are checked before
+# use. It is deliberately NOT cleaned up: the warm cache is the point. Test state
+# is not a concern for a SEQUENTIAL run — the DB fixtures are in-memory and
+# settings are restored per test — but the file is a shared mutable HOME, and two
+# suites at once rewrite the same ``settings.json`` in place. That is what the run
+# marker below refuses.
+# ---------------------------------------------------------------------------
+def _current_uid():
+    """The process uid, or None where the concept does not exist (Windows)."""
+    return getattr(os, "getuid", lambda: None)()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check. Undeterminable counts as dead, not as alive:
+    blocking a legitimate run is a worse failure than an undetected collision."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+_RUN_MARKER = ".pytest-running"
+
+
+def _acquire_run_marker(home: str) -> None:
+    """Refuse to share the test HOME with another live test process.
+
+    The directory is fixed rather than per-run so ChromaDB's model cache stays
+    warm (see the comment block above), which makes it a single shared mutable
+    HOME: two suites started at the same time rewrite the same ``settings.json``
+    in place. Reproduced deliberately with two concurrent runs — one suite
+    reported ``json.decoder.JSONDecodeError`` in
+    ``test_agent_mcp_wiring.py::TestMcpConfigBuilder::test_space_id_becomes_query_param``
+    (a ``load_settings()`` reading the file mid-write) and both took 75 s instead
+    of 43 s, so the damage lands in whatever test happened to read the file. That
+    is indistinguishable from a real regression and sends you bisecting the wrong
+    change. A marker left by a crashed run names a dead pid and is simply taken
+    over.
+    """
+    marker = os.path.join(home, _RUN_MARKER)
+    if os.path.exists(marker):
+        try:
+            with open(marker) as fh:
+                other = int(fh.read().strip())
+        except (OSError, ValueError):
+            other = None
+        if other and other != os.getpid() and _pid_alive(other):
+            raise RuntimeError(
+                f"another Laya test run (pid {other}) is using {home}. The test "
+                "HOME is shared so ChromaDB's model cache stays warm, so two "
+                "concurrent suites overwrite each other's settings and fail in "
+                "unrelated tests. Wait for that run to finish, or isolate this one "
+                "with TMPDIR=<a fresh directory>."
+            )
+    with open(marker, "w") as fh:
+        fh.write(str(os.getpid()))
+
+
+_UID = _current_uid()
+_TEST_HOME = os.path.join(
+    os.path.realpath(tempfile.gettempdir()),
+    "laya-test-home" if _UID is None else f"laya-test-home-{_UID}",
+)
+os.makedirs(_TEST_HOME, mode=0o700, exist_ok=True)
+_stat = os.lstat(_TEST_HOME)
+if (
+    not os.path.isdir(_TEST_HOME)
+    or os.path.islink(_TEST_HOME)
+    or (_UID is not None and _stat.st_uid != _UID)
+    or _stat.st_mode & 0o077
+):
+    raise RuntimeError(
+        f"refusing to use {_TEST_HOME} as the test HOME: it must be a real "
+        f"directory owned by uid {_UID} with no group/other access "
+        f"(mode={oct(_stat.st_mode & 0o777)}, uid={_stat.st_uid}). Remove it "
+        "and re-run, or point TMPDIR at a directory only you control."
+    )
+_acquire_run_marker(_TEST_HOME)
+atexit.register(lambda: os.path.exists(os.path.join(_TEST_HOME, _RUN_MARKER))
+                and os.remove(os.path.join(_TEST_HOME, _RUN_MARKER)))
 os.environ["HOME"] = _TEST_HOME
 os.environ["USERPROFILE"] = _TEST_HOME
 
 import aiosqlite  # noqa: E402
+import keyring  # noqa: E402
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
+from keyring.backend import KeyringBackend  # noqa: E402
+from keyring.errors import PasswordDeleteError  # noqa: E402
+
+
+class _InMemoryKeyring(KeyringBackend):
+    """A keychain that exists only in this process and dies with it.
+
+    Deliberately a faithful stand-in rather than a null backend: tests store a
+    token and read it back (``test_mcp_http.py::test_ensure_startup_token_creates_
+    when_missing``, ``test_agent_mcp_wiring.py::test_bearer_token_in_headers_when_
+    auth_bearer``), so a backend that silently discards writes would fail them
+    for the wrong reason.
+    """
+
+    priority = 100
+
+    def __init__(self):
+        super().__init__()
+        self._store: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service, username):
+        return self._store.get((service, username))
+
+    def set_password(self, service, username, password):
+        self._store[(service, username)] = password
+
+    def delete_password(self, service, username):
+        try:
+            del self._store[(service, username)]
+        except KeyError:
+            # The real backends raise here, and ``delete_mcp_token`` reports the
+            # failure — keep that contract so the engine takes the same path.
+            raise PasswordDeleteError(f"no password stored for {service}/{username}")
+
+
+# Install it before the first ``laya`` import, alongside the HOME redirect above.
+# ``set_keyring`` is the documented, explicit mechanism. Note that defining the
+# subclass is *also* enough on its own: ``keyring`` discovers backends by walking
+# ``KeyringBackend.__subclasses__()`` and picks the highest ``priority``, and 100
+# beats every shipped backend, so merely importing this module already selects it.
+# Both are kept — the explicit call states the intent, and the ``isinstance``
+# guard below turns either mechanism failing into a hard stop.
+keyring.set_keyring(_InMemoryKeyring())
 
 from laya.config import LAYA_HOME, MIGRATIONS_DIR  # noqa: E402
 from laya.db.migrate import run_migrations  # noqa: E402
-from laya.models.classification import Persona, RouterOutput
-from laya.models.event import LayaEvent
-from laya.models.rules import RulesConfig
-from laya.models.team import TeamConfig
+from laya.models.classification import Persona, RouterOutput  # noqa: E402
+from laya.models.event import LayaEvent  # noqa: E402
+from laya.models.rules import RulesConfig  # noqa: E402
+from laya.models.team import TeamConfig  # noqa: E402
+
+# Both guards run at import, not in a test. That is the point: pytest collects
+# and runs ``test_agent_mcp_wiring.py`` and ``test_mcp_http.py`` before any test
+# file named after them, so a guard that lives in a test reports the damage only
+# after the two fixtures that do it have already run. Here, a broken isolation
+# stops the session before a single fixture can touch either store.
+if not Path(LAYA_HOME).resolve().is_relative_to(Path(_TEST_HOME)):
+    raise RuntimeError(
+        f"LAYA_HOME resolved to {LAYA_HOME}, outside the test HOME "
+        f"{_TEST_HOME}. The HOME redirect above must run before the first "
+        "`laya` import; something imported laya.config earlier."
+    )
+if not isinstance(keyring.get_keyring(), _InMemoryKeyring):
+    raise RuntimeError(
+        f"the process keychain is {keyring.get_keyring()!r}, not the in-memory "
+        "test backend. A fixture calling delete_mcp_token() would delete the "
+        "developer's real bearer token."
+    )
 
 
 @pytest.fixture(autouse=True)
