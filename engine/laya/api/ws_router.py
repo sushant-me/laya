@@ -209,6 +209,9 @@ async def _handle_chat_message(msg: dict) -> None:
                 "content": "I'm sorry, I encountered an error. Please try again.",
                 "referenced_cards": [],
                 "referenced_events": [],
+                # Same shape as a real assistant message, so a client can render either
+                # without a special case.
+                "tool_calls": [],
             },
         })
 

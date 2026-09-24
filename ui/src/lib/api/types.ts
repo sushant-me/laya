@@ -794,6 +794,8 @@ export interface ChatMessage {
 	content: string;
 	referenced_cards: string[];
 	referenced_events: string[];
+	/** Tool names the assistant used for this message; absent on the in-flight placeholder. */
+	tool_calls?: string[];
 	conversation_id?: string;
 }
 

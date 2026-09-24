@@ -10,7 +10,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from laya.llm.client import LLMResponse
-from tests.conftest import insert_test_card, insert_test_event
+from tests.conftest import insert_test_card, insert_test_conversation, insert_test_event
 
 
 def _mock_llm_response(content: str = "Here is my response about [card:card_123].") -> LLMResponse:
@@ -22,19 +22,6 @@ def _mock_llm_response(content: str = "Here is my response about [card:card_123]
         output_tokens=50,
         latency_ms=200,
     )
-
-
-async def _create_conversation(db, conversation_id="conv_test01", space_id=None):
-    """Create a conversation row and return its ID."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    await db.execute(
-        """INSERT INTO chat_conversations (conversation_id, title, space_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (conversation_id, "Test Conversation", space_id, now, now),
-    )
-    await db.commit()
-    return conversation_id
 
 
 async def _insert_chat_message(db, message_id, role, content, conversation_id):
@@ -87,7 +74,7 @@ class TestChatAPI:
 
     async def test_chat_history_endpoint(self, db):
         """GET /chat/history returns stored messages."""
-        conv_id = await _create_conversation(db)
+        conv_id = await insert_test_conversation(db)
         await _insert_chat_message(db, "msg_1", "user", "Hello", conv_id)
         await _insert_chat_message(db, "msg_2", "assistant", "Hi there!", conv_id)
 
@@ -102,7 +89,7 @@ class TestChatAPI:
 
     async def test_chat_history_limit(self, db):
         """GET /chat/history?limit=1 respects limit parameter."""
-        conv_id = await _create_conversation(db)
+        conv_id = await insert_test_conversation(db)
         for i in range(5):
             await _insert_chat_message(db, f"msg_{i}", "user", f"Message {i}", conv_id)
 
@@ -441,7 +428,7 @@ class TestStreamingPersistence:
         from laya.llm.client import StreamEvent
         from laya.pipeline.chat import process_chat_message_streaming
 
-        conv_id = await _create_conversation(db, "conv_stream_ok")
+        conv_id = await insert_test_conversation(db, "conv_stream_ok")
 
         async def fake_stream(**kwargs):
             yield StreamEvent(type="chunk", content="Hello ")
@@ -475,7 +462,7 @@ class TestStreamingPersistence:
         from laya.llm.client import StreamEvent
         from laya.pipeline.chat import process_chat_message_streaming, _INTERRUPTED_MARKER
 
-        conv_id = await _create_conversation(db, "conv_stream_cut")
+        conv_id = await insert_test_conversation(db, "conv_stream_cut")
 
         async def fake_stream(**kwargs):
             yield StreamEvent(type="chunk", content="Partial ")
@@ -506,7 +493,7 @@ class TestStreamingPersistence:
         from laya.llm.client import StreamEvent
         from laya.pipeline.chat import process_chat_message_streaming
 
-        conv_id = await _create_conversation(db, "conv_stream_cancel")
+        conv_id = await insert_test_conversation(db, "conv_stream_cancel")
         llm_entered = asyncio.Event()
 
         async def fake_stream(**kwargs):

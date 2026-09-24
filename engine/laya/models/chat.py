@@ -15,6 +15,11 @@ class ChatMessage(BaseModel):
     content: str
     referenced_cards: list[str] = Field(default_factory=list)
     referenced_events: list[str] = Field(default_factory=list)
+    # Names of the tools the assistant called while producing this message. Persisted in
+    # `chat_messages.tool_calls_json` since migration 019 and surfaced here so the UI can keep
+    # a reference after the turn ends — the transient "Looking up: …" indicator is gone the
+    # moment the last tool finishes.
+    tool_calls: list[str] = Field(default_factory=list)
     conversation_id: str | None = None
 
 

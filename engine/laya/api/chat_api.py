@@ -21,7 +21,7 @@ from laya.models.chat import (
     Conversation,
     CreateConversationRequest,
 )
-from laya.pipeline.chat import canonical_card_ids, process_chat_message
+from laya.pipeline.chat import canonical_card_ids, process_chat_message, tool_call_names
 
 log = structlog.get_logger()
 router = APIRouter()
@@ -78,7 +78,7 @@ async def get_chat_history(
     # the same second, so without it a mid-stream reload could swap their order.
     rows = await db.execute_fetchall(
         f"""SELECT message_id, timestamp, role, content,
-                   referenced_cards, referenced_events, conversation_id
+                   referenced_cards, referenced_events, tool_calls_json, conversation_id
             FROM chat_messages
             {where}
             ORDER BY timestamp DESC, rowid DESC
@@ -98,6 +98,7 @@ async def get_chat_history(
                 content=row["content"],
                 referenced_cards=ref_cards,
                 referenced_events=ref_events,
+                tool_calls=tool_call_names(row["tool_calls_json"]),
                 conversation_id=row["conversation_id"],
             )
         )
@@ -220,7 +221,7 @@ async def get_conversation_messages(
     if before:
         rows = await db.execute_fetchall(
             """SELECT message_id, timestamp, role, content,
-                      referenced_cards, referenced_events, conversation_id
+                      referenced_cards, referenced_events, tool_calls_json, conversation_id
                FROM chat_messages
                WHERE conversation_id = ? AND timestamp < ?
                ORDER BY timestamp DESC, rowid DESC
@@ -230,7 +231,7 @@ async def get_conversation_messages(
     else:
         rows = await db.execute_fetchall(
             """SELECT message_id, timestamp, role, content,
-                      referenced_cards, referenced_events, conversation_id
+                      referenced_cards, referenced_events, tool_calls_json, conversation_id
                FROM chat_messages
                WHERE conversation_id = ?
                ORDER BY timestamp DESC, rowid DESC
@@ -250,6 +251,7 @@ async def get_conversation_messages(
                 content=row["content"],
                 referenced_cards=ref_cards,
                 referenced_events=ref_events,
+                tool_calls=tool_call_names(row["tool_calls_json"]),
                 conversation_id=row["conversation_id"],
             )
         )

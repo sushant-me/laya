@@ -257,6 +257,42 @@ async def _generate_title_background(
         )
 
 
+def tool_call_names(tool_calls: list | str | None) -> list[str]:
+    """The names of the tools a turn used, de-duplicated, in first-seen order.
+
+    One implementation, because two callers derive the same list from the same turn and they
+    must not disagree: the pipeline derives it to persist on the row and to put on the live
+    `chat_stream_done` payload, and the history loaders derive it back out of
+    `chat_messages.tool_calls_json`. It keeps first-seen order and drops duplicates because
+    the reference answers "which tools did this turn use" — a tool called three times reads
+    the same as once.
+
+    Input is the in-memory log (a list of dicts carrying "name") from the pipeline, or the
+    stored JSON text from a history load. Anything unrecognised yields an empty list rather
+    than raising: a history load is not the place to fail on one row written by an older
+    shape, and the message still renders without its tool references. A bare string entry is
+    read as a name — an older `tool_calls_json` may be a plain list of names, and skipping
+    those would silently drop the very references this surfaces.
+    """
+    if isinstance(tool_calls, str):
+        try:
+            parsed = json.loads(tool_calls)
+        except (TypeError, ValueError):
+            return []
+    elif tool_calls is None:
+        return []
+    else:
+        parsed = tool_calls
+    if not isinstance(parsed, list):
+        return []
+    names: list[str] = []
+    for entry in parsed:
+        name = entry.get("name") if isinstance(entry, dict) else entry
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
 async def process_chat_message(
     user_message: str,
     space_id: str | None = None,
@@ -451,6 +487,7 @@ async def process_chat_message(
         content=assistant_content,
         referenced_cards=referenced_cards,
         referenced_events=referenced_events,
+        tool_calls=tool_call_names(tool_calls_log),
         conversation_id=conversation_id,
     )
 
@@ -768,6 +805,9 @@ async def process_chat_message_streaming(
             "content": full_content,
             "referenced_cards": referenced_cards,
             "referenced_events": referenced_events,
+            # Same list that was just persisted to tool_calls_json, so a reload and the live
+            # turn agree about which tools produced this message.
+            "tool_calls": tool_call_names(tool_calls_log),
             "conversation_id": conversation_id,
         },
     }

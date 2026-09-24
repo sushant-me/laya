@@ -425,3 +425,20 @@ async def insert_test_card(db, card_id="card_test", event_id="evt_test",
          entity_id or f"jira:ticket:BUG-1234", space_id),
     )
     await db.commit()
+
+
+async def insert_test_conversation(db, conversation_id="conv_test01", space_id=None):
+    """Insert a chat conversation row and return its ID.
+
+    Shared by the chat tests: this lived in `tests/test_chat_api.py` and was the suite's
+    only cross-test-module import, while every other fixture helper lives here.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        """INSERT INTO chat_conversations (conversation_id, title, space_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (conversation_id, "Test Conversation", space_id, now, now),
+    )
+    await db.commit()
+    return conversation_id
