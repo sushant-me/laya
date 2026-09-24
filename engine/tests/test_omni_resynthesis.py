@@ -15,6 +15,186 @@ from tests.conftest import insert_test_card
 
 
 @pytest.mark.asyncio
+class TestUnitemisedCardsAreNotLost:
+    """Resynthesis may only look forward.
+
+    The fetch is `created_at > <the last snapshot's generated_at>`, and storing a
+    snapshot advances that watermark to now. So a card the model folds into no
+    section is not merely missing from *this* snapshot: it is outside the fetch
+    window for every later run as well, and its content never reaches a prompt
+    again. #10 measured the shape — a local model dropped ~20 of 27 low-value
+    cards — and proposed the remedy: a deterministic catch-all for any `new_cards`
+    absent from every section's `source_cards`.
+
+    These tests pin the loss first, then the catch-all.
+    """
+
+    async def _seed(self, db, ids, prefix="drop", after_watermark=False):
+        """Cards placed inside the fetch window.
+
+        `after_watermark` puts them a couple of seconds ahead of now, because the
+        fetch is `created_at > <the last snapshot's generated_at>`: a snapshot
+        written moments ago is already the watermark, so seeding "an hour ago" a
+        second time would place the new cards *behind* it and they would never be
+        offered at all — a different failure from the one under test.
+        """
+        offset = timedelta(seconds=2) if after_watermark else timedelta(hours=-1)
+        base = datetime.now(timezone.utc) + offset
+        for i, cid in enumerate(ids):
+            ts = (base + timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
+            await insert_test_card(
+                db, card_id=cid, event_id=f"evt_{prefix}_{i}", space_id="default",
+                header=f"Headline {prefix}-{i}",
+            )
+            await db.execute("UPDATE action_cards SET created_at = ? WHERE card_id = ?", (ts, cid))
+        await db.commit()
+
+    def _sections_mentioning(self, sections):
+        mentioned = set()
+        for section in sections:
+            for item in section.get("items", []):
+                mentioned.update(c for c in item.get("source_cards", []) if c)
+        return mentioned
+
+    async def _run(self, db, sections):
+        from laya.pipeline import omni as omni_pipeline
+
+        omni_pipeline._latest_cache.pop("default", None)
+        seen = []
+
+        async def fake_llm(**kwargs):
+            seen.append(kwargs)
+
+            class R:
+                parsed = {"sections": sections}
+                truncated = False
+                output_tokens = 10
+                model = "test"
+            return R()
+
+        with patch.object(omni_pipeline, "llm_call", new=fake_llm):
+            result = await omni_pipeline._resynthesize_space(
+                db, "default", density="compact", snapshot_type="manual", event_threshold=50)
+        return result, seen
+
+    async def _latest(self, db):
+        rows = await db.execute_fetchall(
+            """SELECT content_json FROM omni_snapshots WHERE space_id = 'default'
+               AND is_delta = 0 ORDER BY version DESC LIMIT 1""", ())
+        return json.loads(rows[0]["content_json"])
+
+    def _partial_result(self):
+        """The model itemises one card and silently drops the other two."""
+        return [
+            {"type": "attention", "label": None, "items": []},
+            {"type": "recent", "label": None, "items": [
+                {"text": "Itemised update", "source_cards": ["card_keep"],
+                 "entity_ids": ["github:issue:org/repo/#1"], "platforms": ["github"],
+                 "priority": "MEDIUM", "pinned": False}]},
+            {"type": "period", "label": None, "items": []},
+            {"type": "milestone", "label": None, "items": []},
+        ]
+
+    async def test_a_dropped_card_is_still_represented_in_the_snapshot(self, db):
+        await self._seed(db, ["card_keep", "card_lost_a", "card_lost_b"])
+
+        result, _ = await self._run(db, self._partial_result())
+
+        assert result is not None
+        mentioned = self._sections_mentioning((await self._latest(db))["sections"])
+        assert {"card_lost_a", "card_lost_b"} <= mentioned, (
+            "a card the model did not itemise is absent from the snapshot entirely: "
+            f"represented={sorted(mentioned)}"
+        )
+
+    async def test_a_dropped_card_never_returns_to_a_later_prompt(self, db):
+        """The permanence half: this is why it needs a deterministic catch-all
+        rather than a retry. Run 2 may not see the cards run 1 dropped."""
+        await self._seed(db, ["card_keep", "card_lost_a", "card_lost_b"])
+        await self._run(db, self._partial_result())
+
+        await self._seed(db, ["card_next"], prefix="next", after_watermark=True)
+        _, seen = await self._run(db, self._partial_result())
+
+        assert seen, "the second run did not call the model"
+        prompt = str(seen[-1]["messages"])
+        # The fetch window, read out of the prompt the model was actually given.
+        fresh = prompt.split("[NEW CARDS SINCE LAST SYNTHESIS]")[1].split("[END NEW CARDS]")[0]
+        assert "card_next" in fresh, "the brand-new card was not offered"
+        assert "card_lost_a" not in fresh and "card_lost_b" not in fresh, (
+            "a card dropped before the watermark advanced was re-offered as new"
+        )
+        # ...and the fix is why that is no longer a loss: the catch-all item stored
+        # in run 1 is carried forward, so run 2 still shows the model the content.
+        assert "Headline drop-1" in prompt
+
+    async def test_the_catch_all_is_not_an_attention_item(self, db):
+        """#10 is explicit that attention selection belongs to the model; a
+        code-authored attention entry is the kind of thing that made the section
+        untrustworthy in the first place."""
+        await self._seed(db, ["card_keep", "card_lost_a"])
+        await self._run(db, self._partial_result())
+
+        content = await self._latest(db)
+        attention = [it for s in content["sections"] if s.get("type") == "attention"
+                     for it in s.get("items", [])]
+        assert attention == []
+
+    async def test_the_catch_all_carries_the_cards_and_a_renderable_key(self, db):
+        """The item has to be usable: the dropped ids as `source_cards` so the UI
+        can open them, and an `item_key` — the board keys its lists by it, and a
+        duplicate is a hard render error that takes the whole page down."""
+        await self._seed(db, ["card_keep", "card_lost_a", "card_lost_b"])
+        await self._run(db, self._partial_result())
+
+        sections = (await self._latest(db))["sections"]
+        catch_all = [
+            it for s in sections for it in s.get("items", [])
+            if {"card_lost_a", "card_lost_b"} <= set(it.get("source_cards", []))
+        ]
+        assert len(catch_all) == 1
+        item = catch_all[0]
+        assert item.get("item_key"), "the catch-all item has no item_key"
+        # The titles are in the text, so the content survives in the narrative and
+        # not only behind a link.
+        assert "Headline drop-1" in item["text"]
+        assert item["text"].startswith("2 further updates")
+
+    async def test_the_catch_all_is_announced_as_an_addition(self, db):
+        """It has to be added before the change summary is computed. Added after, it
+        is in neither side of the next diff either, so the board never mentions those
+        cards at all — which is the silent loss this whole change is about."""
+        await self._seed(db, ["card_keep", "card_lost_a", "card_lost_b"])
+        await self._run(db, self._partial_result())
+
+        rows = await db.execute_fetchall(
+            """SELECT change_summary_json FROM omni_snapshots WHERE space_id = 'default'
+               AND is_delta = 0 ORDER BY version DESC LIMIT 1""", ())
+        summary = json.loads(rows[0]["change_summary_json"])
+        added = [entry.get("text", "") for entry in summary["added"]]
+        assert any("2 further updates" in text for text in added), added
+
+    async def test_nothing_is_added_when_the_model_represented_every_card(self, db):
+        """A catch-all that fires on a clean run is noise in every snapshot."""
+        await self._seed(db, ["card_keep"])
+        full = [
+            {"type": "attention", "label": None, "items": []},
+            {"type": "recent", "label": None, "items": [
+                {"text": "Only update", "source_cards": ["card_keep"],
+                 "entity_ids": ["github:issue:org/repo/#1"], "platforms": ["github"],
+                 "priority": "MEDIUM", "pinned": False}]},
+            {"type": "period", "label": None, "items": []},
+            {"type": "milestone", "label": None, "items": []},
+        ]
+
+        await self._run(db, full)
+
+        sections = (await self._latest(db))["sections"]
+        texts = [it.get("text", "") for s in sections for it in s.get("items", [])]
+        assert texts == ["Only update"], texts
+
+
+@pytest.mark.asyncio
 class TestEventThresholdClamp:
     """PUT /settings clamps omni.event_threshold to [0, 100]."""
 

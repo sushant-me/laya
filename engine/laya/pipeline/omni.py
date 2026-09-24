@@ -623,6 +623,99 @@ async def _append_to_recent(cards: list[dict]) -> None:
 # section. No local mirror — that previously risked silent divergence.
 _PRIORITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
+# How many card titles the catch-all item names before it stops listing. The full
+# set still travels as `source_cards` (that is what the UI opens), but the text has
+# to stay bounded: a run can drop dozens of cards at once.
+_CATCH_ALL_MAX_TITLES = 3
+
+
+def _unrepresented_new_cards(new_cards: list[dict],
+                             result_sections: list[dict]) -> list[dict]:
+    """Cards this run processed that the result mentions nowhere.
+
+    Resynthesis only ever fetches `created_at > <the last snapshot's
+    generated_at>`, and storing a snapshot moves that watermark to now. So a card
+    the model folds into no section is not just missing from *this* snapshot: it is
+    outside the fetch window for every later run, and its content never reaches a
+    prompt again. #10 measured the shape on a real install — a local model dropped
+    ~20 of 27 low-value cards — and the loss is silent, because the run reports
+    success and the snapshot's stats count the card as processed.
+
+    "Mentions" means appears in some item's `source_cards`. An aggregate that
+    legitimately covers the card counts, which is why this deliberately does not
+    try to judge the model's wording.
+    """
+    represented: set[str] = set()
+    for section in result_sections:
+        for item in section.get("items", []) or []:
+            represented.update(_item_source_cards(item))
+    return [card for card in new_cards if card.get("card_id") not in represented]
+
+
+def _catch_all_item(cards: list[dict]) -> dict:
+    """One deterministic item standing in for cards the model did not itemise.
+
+    Deliberately not an attention item. #10 is explicit that attention selection
+    belongs to the model — a code-authored attention entry is the kind of thing
+    that made the section untrustworthy in the first place — so this goes to
+    `recent`, whose job is recording what happened.
+
+    The card ids travel as `source_cards` so the items are still reachable from the
+    board, and the titles go into the text so the content survives in the narrative
+    rather than only behind a link.
+    """
+    titles: list[str] = []
+    for card in cards:
+        title = (card.get("header") or "").strip()
+        if title and title not in titles:
+            titles.append(title)
+
+    summary = f"{len(cards)} further updates (not itemised by the summary)"
+    if titles:
+        shown = ", ".join(f"\u201c{t}\u201d" for t in titles[:_CATCH_ALL_MAX_TITLES])
+        summary = f"{summary}: {shown}"
+        if len(titles) > _CATCH_ALL_MAX_TITLES:
+            summary += f", and {len(titles) - _CATCH_ALL_MAX_TITLES} more"
+
+    priorities = [c["priority"] for c in cards if c.get("priority") in _PRIORITY_ORDER]
+    return {
+        "text": summary,
+        "source_cards": [c["card_id"] for c in cards if c.get("card_id")],
+        "entity_ids": [c["entity_id"] for c in cards if c.get("entity_id")],
+        "platforms": sorted({c.get("source_platform") for c in cards
+                             if c.get("source_platform")}),
+        "priority": min(priorities, key=_PRIORITY_ORDER.__getitem__) if priorities else "MEDIUM",
+        "pinned": False,
+    }
+
+
+def _add_catch_all_for_unrepresented(new_cards: list[dict],
+                                     result_sections: list[dict],
+                                     space_id: str) -> int:
+    """Append one catch-all item for everything the model left out. Returns the count.
+
+    Runs on the model's own output and only over THIS run's `new_cards`: a carried
+    snapshot item is older than the watermark, so it can never appear here and the
+    attention guard's judgement is not affected by anything this adds.
+    """
+    dropped = _unrepresented_new_cards(new_cards, result_sections)
+    if not dropped:
+        return 0
+
+    item = _catch_all_item(dropped)
+    target = next(
+        (s for s in result_sections if s.get("type") == "recent"),
+        result_sections[-1] if result_sections else None,
+    )
+    if target is None:  # a result with no sections at all is rejected before here
+        return 0
+    target.setdefault("items", []).append(item)
+    log.info(
+        "omni_unitemised_cards_kept",
+        space_id=space_id, kept=len(dropped), section=target.get("type"),
+    )
+    return len(dropped)
+
 
 async def _fetch_card_meta(db, card_ids: list[str]) -> dict[str, dict]:
     """Fetch live per-card state for a set of card_ids.
@@ -1099,6 +1192,19 @@ async def _resynthesize_space(
     # (backfilled just above), and the diff must see the post-prune sections so a
     # resolved attention item reads as `resolved`, not as a silent disappearance.
     decorate_item_keys(result_sections)
+
+    # 7b-ter. Everything above judges what the model DID return; this is about what it
+    # left out. A card absent from every item's `source_cards` drops out of the fetch
+    # window the moment this snapshot is stored, so without a deterministic stand-in
+    # its content never reaches a prompt again (see `_unrepresented_new_cards`).
+    #
+    # Placed after the wipe guard deliberately: that guard must judge the model's own
+    # output, not an item this code authored. The change summary below re-decorates
+    # the sections in place, so this item is still stamped with an `item_key` and
+    # still appears in the diff as `added` — and it has to appear, because an
+    # addition missing from the diff is missing from every later diff too. Both
+    # halves are pinned by tests: moving this call below the summary fails two.
+    kept_dropped = _add_catch_all_for_unrepresented(new_cards, result_sections, space_id)
     change_summary = compute_resynthesis_change_summary(
         prior_sections,
         result_sections,
