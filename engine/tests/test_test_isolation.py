@@ -27,8 +27,8 @@ def test_the_suite_runs_against_a_temporary_home():
     """HOME must be the throwaway directory conftest created, not the real one."""
     home = pathlib.Path(os.environ["HOME"]).resolve()
 
-    assert home.name.startswith("laya-test-home-"), (
-        f"HOME is {home}, which is not the temporary directory conftest creates. "
+    assert home.name.startswith("laya-test-home"), (
+        f"HOME is {home}, which is not the test directory conftest creates. "
         "The redirect in tests/conftest.py runs before the first `laya` import; "
         "if this fails, something imported laya.config earlier and the suite is "
         "writing to the developer's real ~/.laya."

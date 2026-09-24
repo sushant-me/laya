@@ -3,10 +3,8 @@
 
 """Shared test fixtures for Laya Engine tests."""
 
-import atexit
 import json
 import os
-import shutil
 import tempfile
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,10 +24,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # fact would miss every module that did ``from laya.config import LAYA_...``.
 # ``HOME`` covers POSIX, ``USERPROFILE`` covers Windows — ``Path.home()`` reads
 # one or the other, so both are set rather than leaving the platform to chance.
-_TEST_HOME = tempfile.mkdtemp(prefix="laya-test-home-")
+# A FIXED path, reused across runs, not a fresh mkdtemp each time. Redirecting
+# HOME also relocates every cache underneath it, and ChromaDB's embedding model
+# lives in one -- so a throwaway directory made test_chromadb re-download the
+# model on every single run, taking the suite from 43s to 241s. Reusing the
+# directory keeps the cache warm while still keeping the suite out of the real
+# ~/.laya, which is the only property that matters here. Test state is not a
+# concern: the DB fixtures are in-memory and settings are restored per test.
+_TEST_HOME = os.path.join(tempfile.gettempdir(), "laya-test-home")
+os.makedirs(_TEST_HOME, exist_ok=True)
 os.environ["HOME"] = _TEST_HOME
 os.environ["USERPROFILE"] = _TEST_HOME
-atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
