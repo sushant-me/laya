@@ -268,6 +268,11 @@ fn setup_environment(app: tauri::AppHandle) {
         let ensure_result = runtime::ensure_runtimes(|p| {
             let msg = match p {
                 runtime::RuntimeProgress::Phase(s) => s,
+                // `ensure_runtimes` labels each parallel download's byte events
+                // (see `runtime::label_bytes`), so in practice byte progress
+                // arrives as `Phase` and is never seen here.  This arm is the
+                // fallback for any future caller that emits raw `Bytes`: it is
+                // still the right rendering, it just cannot name the runtime.
                 runtime::RuntimeProgress::Bytes { downloaded, total } => match total {
                     Some(t) if t > 0 => format!(
                         "Downloaded {} MB / {} MB",

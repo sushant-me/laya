@@ -141,6 +141,36 @@ pub enum RuntimeProgress {
     Done(String),
 }
 
+/// Prefix a streaming download's byte progress with the runtime it belongs to.
+///
+/// Python, Node.js and uv download in parallel threads and all report
+/// `RuntimeProgress::Bytes` through one mpsc channel (see `ensure_runtimes`).
+/// The variant carries only byte counts, so the setup UI can do no better than
+/// "Downloaded 15 MB / 28 MB" for every one of them.  Two things follow:
+///
+/// * the user cannot tell which runtime a message is about, so three overlapping
+///   downloads read as one serial "Preparing runtimes" step; and
+/// * the counter appears to jump backwards (Python 25 MB -> Node 5 MB) because
+///   each thread tracks its own `downloaded`.
+///
+/// Labelling each thread's byte events fixes both without touching the enum:
+/// the label is known to the thread that starts the download, and each runtime's
+/// own counter stays monotonic.  Non-byte events pass through untouched so the
+/// existing phase/done messages keep their exact wording.
+fn label_bytes(label: &str, progress: RuntimeProgress) -> RuntimeProgress {
+    match progress {
+        RuntimeProgress::Bytes { downloaded, total } => {
+            let mb = downloaded / 1_048_576;
+            let msg = match total {
+                Some(t) if t > 0 => format!("{}: {} MB / {} MB", label, mb, t / 1_048_576),
+                _ => format!("{}: {} MB", label, mb),
+            };
+            RuntimeProgress::Phase(msg)
+        }
+        other => other,
+    }
+}
+
 /// Ensure Python (3.10+), Node (22+), and uv runtimes are available, either
 /// from the system or downloaded into `~/.laya/{python,node,uv}/`.
 ///
@@ -172,26 +202,27 @@ pub fn ensure_runtimes<F: FnMut(RuntimeProgress)>(mut on_progress: F) -> Result<
 
     // Download needed runtimes in parallel.  Each thread sends progress
     // events through an mpsc channel; the calling thread drains them
-    // into the original callback.
+    // into the original callback.  Each thread labels its own byte events
+    // (see `label_bytes`) so interleaved downloads stay distinguishable.
     let (tx, rx) = std::sync::mpsc::channel::<RuntimeProgress>();
     let mut handles: Vec<std::thread::JoinHandle<Result<(), String>>> = Vec::new();
 
     if python_needed {
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
-            provision_python(&mut |p| { let _ = tx.send(p); })
+            provision_python(&mut |p| { let _ = tx.send(label_bytes("Python", p)); })
         }));
     }
     if node_needed {
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
-            provision_node(&mut |p| { let _ = tx.send(p); })
+            provision_node(&mut |p| { let _ = tx.send(label_bytes("Node.js", p)); })
         }));
     }
     if uv_needed {
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
-            provision_uv(&mut |p| { let _ = tx.send(p); })
+            provision_uv(&mut |p| { let _ = tx.send(label_bytes("uv", p)); })
         }));
     }
 
@@ -799,5 +830,120 @@ mod tests {
     #[test]
     fn hex_lower_emits_lowercase_hex() {
         assert_eq!(hex_lower(&[0xab, 0xcd, 0x01, 0xff]), "abcd01ff");
+    }
+
+    /// `RuntimeProgress` derives nothing, so pull the human-facing message out
+    /// by hand; `None` means the event was left as raw byte progress.
+    fn message(p: RuntimeProgress) -> Option<String> {
+        match p {
+            RuntimeProgress::Phase(s) | RuntimeProgress::Done(s) => Some(s),
+            RuntimeProgress::Bytes { .. } => None,
+        }
+    }
+
+    const MB: u64 = 1_048_576;
+
+    #[test]
+    fn label_bytes_names_the_runtime_and_keeps_the_total() {
+        // The reported symptom: this used to read "Downloaded 15 MB / 28 MB"
+        // with no way to tell which of the three parallel downloads it was.
+        let labelled = label_bytes(
+            "Python",
+            RuntimeProgress::Bytes { downloaded: 15 * MB, total: Some(28 * MB) },
+        );
+        assert_eq!(message(labelled).as_deref(), Some("Python: 15 MB / 28 MB"));
+    }
+
+    #[test]
+    fn label_bytes_omits_the_total_when_unknown() {
+        let labelled = label_bytes(
+            "uv",
+            RuntimeProgress::Bytes { downloaded: 5 * MB, total: None },
+        );
+        assert_eq!(message(labelled).as_deref(), Some("uv: 5 MB"));
+    }
+
+    #[test]
+    fn label_bytes_treats_a_zero_total_as_unknown() {
+        // A server that omits Content-Length can leave total at 0; dividing by
+        // it or printing "5 MB / 0 MB" would both be wrong.
+        let labelled = label_bytes(
+            "Python",
+            RuntimeProgress::Bytes { downloaded: 5 * MB, total: Some(0) },
+        );
+        assert_eq!(message(labelled).as_deref(), Some("Python: 5 MB"));
+    }
+
+    #[test]
+    fn label_bytes_truncates_partial_megabytes() {
+        // Integer division, stated explicitly so the rounding behaviour is not
+        // mistaken for a bug later.
+        let labelled = label_bytes(
+            "Node.js",
+            RuntimeProgress::Bytes { downloaded: MB - 1, total: Some(45 * MB) },
+        );
+        assert_eq!(message(labelled).as_deref(), Some("Node.js: 0 MB / 45 MB"));
+    }
+
+    #[test]
+    fn label_bytes_leaves_phase_and_done_events_untouched() {
+        // Only byte events are relabelled; the existing phase/done wording that
+        // the setup UI shows must not drift.
+        let phase = label_bytes(
+            "Python",
+            RuntimeProgress::Phase("Verifying Python checksum".to_string()),
+        );
+        assert_eq!(message(phase).as_deref(), Some("Verifying Python checksum"));
+
+        let done = label_bytes(
+            "Python",
+            RuntimeProgress::Done(format!("Python {} ready", PYTHON_VERSION)),
+        );
+        assert_eq!(
+            message(done).as_deref(),
+            Some(format!("Python {} ready", PYTHON_VERSION).as_str())
+        );
+    }
+
+    #[test]
+    fn label_bytes_makes_same_offset_downloads_distinguishable() {
+        // The regression guard.  Both runtimes are at 5 MB; before labelling
+        // these two events produced byte-identical messages, which is why the
+        // parallel downloads read as one serial step.
+        let python = label_bytes(
+            "Python",
+            RuntimeProgress::Bytes { downloaded: 5 * MB, total: Some(28 * MB) },
+        );
+        let node = label_bytes(
+            "Node.js",
+            RuntimeProgress::Bytes { downloaded: 5 * MB, total: Some(45 * MB) },
+        );
+
+        let (p, n) = (message(python), message(node));
+        assert_ne!(p, n);
+        assert_eq!(p.as_deref(), Some("Python: 5 MB / 28 MB"));
+        assert_eq!(n.as_deref(), Some("Node.js: 5 MB / 45 MB"));
+    }
+
+    #[test]
+    fn every_runtime_gets_a_distinct_label() {
+        // Byte events carry only counts, so the label is the only thing that says
+        // which runtime a message is about: two runtimes sharing one label would
+        // read as a single serial step. This pins the labels and their formatting.
+        //
+        // It does NOT reach the three `label_bytes("…", p)` call sites in
+        // `ensure_runtimes`: those run inside download threads, so exercising them
+        // means actually provisioning Python/Node/uv. A wrong label at a call site
+        // is therefore not caught here.
+        let labels = ["Python", "Node.js", "uv"];
+        let mut seen = std::collections::HashSet::new();
+        for label in labels {
+            let labelled = label_bytes(
+                label,
+                RuntimeProgress::Bytes { downloaded: MB, total: Some(2 * MB) },
+            );
+            assert_eq!(message(labelled).as_deref(), Some(&*format!("{label}: 1 MB / 2 MB")));
+            assert!(seen.insert(label), "duplicate label {label}");
+        }
     }
 }
