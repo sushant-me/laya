@@ -26,10 +26,14 @@ from laya.config import load_settings
 from laya.db.sqlite import get_db
 from laya.db.timeutil import db_now
 from laya.llm.client import DEFAULT_MAX_TOKENS, llm_call
-from laya.models.card_lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
+from laya.models.card_lifecycle import (
+    INACTIVE_STATUSES,
+    TERMINAL_STATUSES as _TERMINAL_STATUSES,
+)
 from laya.llm.prompts.omni import (
     build_omni_resynthesis_messages,
     get_omni_json_schema,
+    needs_open_items,
 )
 from laya.models.omni import OmniItem, OmniSection, OmniSnapshot, OmniStats
 from laya.pipeline.omni_change import (
@@ -49,6 +53,13 @@ log = structlog.get_logger()
 # sequential smaller calls instead. ~30-50 is the sweet spot: strictly smaller
 # calls that local models can complete, at the cost of more of them.
 _RESYNTH_CHUNK_SIZE = 40
+
+# Live, high-priority subjects offered to the model as attention CANDIDATES (see
+# `_fetch_open_items`). Capped because the block competes for the same window the snapshot
+# and the new cards need; the total is passed through regardless, so the prompt can say
+# whether the model is looking at all of them or a window.
+_OPEN_ITEMS_CAP = 40
+_OPEN_ITEM_PRIORITIES = ("CRITICAL", "HIGH")
 
 # ---------------------------------------------------------------------------
 # In-memory cache for the latest reconstructed snapshot per space.
@@ -661,6 +672,28 @@ def _item_source_cards(item: dict) -> list[str]:
     return [c for c in item.get("source_cards", []) if c]
 
 
+def _snapshot_entity_ids(snapshot: dict | None, meta: dict[str, dict]) -> set[str]:
+    """Every entity_id the current snapshot already accounts for.
+
+    The open-items block tells the model its entries are "NOT in the snapshot above", so the
+    caller has to know which subjects that snapshot names. Two sources, because a stored
+    snapshot may only carry one of them: the item's own `entity_ids` (what the LLM writes, and
+    what step 7b backfills on store), and its `source_cards` resolved through live card
+    metadata, which covers an item stored before its `entity_ids` were filled in.
+    """
+    entity_ids: set[str] = set()
+    for section in (snapshot or {}).get("sections", []) or []:
+        for item in section.get("items", []) or []:
+            for entity_id in item.get("entity_ids") or []:
+                if entity_id:
+                    entity_ids.add(entity_id)
+            for card_id in _item_source_cards(item):
+                entity_id = (meta.get(card_id) or {}).get("entity_id")
+                if entity_id:
+                    entity_ids.add(entity_id)
+    return entity_ids
+
+
 def _live_max_priority(card_ids: list[str], meta: dict[str, dict]) -> str | None:
     """Highest priority among non-terminal source cards, or None if all resolved/unknown."""
     best: str | None = None
@@ -674,6 +707,86 @@ def _live_max_priority(card_ids: list[str], meta: dict[str, dict]) -> str | None
             best_rank = rank
             best = m.get("priority", "MEDIUM")
     return best
+
+
+async def _fetch_open_items(
+    db,
+    space_id: str,
+    exclude_entity_ids: set[str] | None = None,
+) -> tuple[list[dict], int]:
+    """Live HIGH/CRITICAL subjects, one row per entity, for the model to consider.
+
+    Attention is carried forward from the previous snapshot. So a space whose attention
+    section was emptied — by the failure mode the attention-wipe guard rejects, or by a
+    synthesis that ran before that guard existed — cannot repopulate on its own: the
+    request it is given contains no attention to carry forward, and the `since` window that
+    produces `new_cards` excludes a standing backlog months old. The model then correctly
+    returns an empty attention section for the starved request it is given, which is why the
+    section can stay empty for months while the cards under it are open.
+
+    This is INPUT, not attention. Nothing here is written into the output by code: the
+    candidates are laid out in the prompt and the model decides what, if anything, belongs
+    in the section — no item is promoted, no item is injected, and a run that ignores the
+    block behaves exactly as before.
+
+    `exclude_entity_ids` is the set the caller derived from the current snapshot. The block
+    tells the model its entries are "NOT in the snapshot above", so a subject the snapshot
+    already accounts for — in ANY section, because the framing names the whole snapshot — is
+    dropped here rather than re-offered as if the snapshot had lost it. Together with
+    `needs_open_items` in the prompt builder that is what makes the framing true of the data
+    it is attached to. The second return value is the full count of matching entities after
+    that exclusion and before the cap, so the prompt can say whether it is showing all of
+    them.
+
+    One row per entity: the most recently active, since a subject's newest card is what
+    describes its current state. A card with no entity key is skipped, NULL or empty —
+    the same degenerate case `LayaEvent.entity_id` guards against, where a blank key would
+    collapse unrelated subjects into one group, and here it would offer the model a
+    candidate that names no subject at all.
+    """
+    inactive = tuple(INACTIVE_STATUSES)
+    placeholders = ", ".join("?" for _ in inactive)
+    prio_placeholders = ", ".join("?" for _ in _OPEN_ITEM_PRIORITIES)
+    rows = await db.execute_fetchall(
+        f"""SELECT entity_id, header, priority, status,
+                   COALESCE(group_active_at, created_at) AS last_active,
+                   (SELECT COUNT(*) FROM action_cards x
+                     WHERE x.entity_id = c.entity_id
+                       AND x.space_id = c.space_id
+                       AND x.status NOT IN ({placeholders})) AS open_cards
+              FROM action_cards c
+             WHERE c.space_id = ?
+               AND c.status NOT IN ({placeholders})
+               AND c.priority IN ({prio_placeholders})
+               AND c.entity_id IS NOT NULL
+               AND c.entity_id != ''
+             ORDER BY last_active DESC, c.card_id DESC""",
+        (*inactive, space_id, *inactive, *_OPEN_ITEM_PRIORITIES),
+    )
+    newest_per_entity: dict[str, dict] = {}
+    for row in rows:
+        entity_id = row["entity_id"]
+        if entity_id in newest_per_entity:
+            continue  # ordered by activity, so the first row for an entity is its newest
+        newest_per_entity[entity_id] = {
+            "entity_id": entity_id,
+            "header": row["header"],
+            "priority": row["priority"],
+            "status": row["status"],
+            "open_cards": row["open_cards"],
+            "last_active": row["last_active"],
+        }
+    if exclude_entity_ids:
+        for entity_id in list(newest_per_entity):
+            if entity_id in exclude_entity_ids:
+                del newest_per_entity[entity_id]
+    # The cap is applied here rather than as a SQL LIMIT on purpose: rows have to be reduced
+    # to one per entity and filtered against the snapshot before a window means anything, and
+    # a row LIMIT would truncate first — spending the window on excluded subjects and on a
+    # subject's older cards while a subject that belongs in it is never fetched. `card_id` is
+    # the primary key, so the ordering above is a total order and this slice is stable.
+    total = len(newest_per_entity)
+    return list(newest_per_entity.values())[:_OPEN_ITEMS_CAP], total
 
 
 def _all_resolved(card_ids: list[str], meta: dict[str, dict]) -> bool:
@@ -873,14 +986,15 @@ async def _resynthesize_space(
     # auto-resolution path (emit.py) transitions the very sibling cards embedded
     # in the aggregate to a terminal status.
     item_states: list[dict] = []
+    snapshot_meta: dict[str, dict] = {}
     if current_snapshot:
+        # Every section's source cards, not just attention/recent: the same fetch is what
+        # tells the open-items filter which subjects the snapshot already accounts for.
         snapshot_card_ids: list[str] = []
         for section in current_snapshot.get("sections", []):
-            if section.get("type") not in ("attention", "recent"):
-                continue
             for item in section.get("items", []):
                 snapshot_card_ids.extend(_item_source_cards(item))
-        snap_meta = await _fetch_card_meta(db, snapshot_card_ids)
+        snapshot_meta = await _fetch_card_meta(db, snapshot_card_ids)
         for section in current_snapshot.get("sections", []):
             if section.get("type") not in ("attention", "recent"):
                 continue
@@ -890,8 +1004,8 @@ async def _resynthesize_space(
                     continue
                 item_states.append({
                     "text": item.get("text", ""),
-                    "all_resolved": _all_resolved(cids, snap_meta),
-                    "live_max_priority": _live_max_priority(cids, snap_meta),
+                    "all_resolved": _all_resolved(cids, snapshot_meta),
+                    "live_max_priority": _live_max_priority(cids, snapshot_meta),
                 })
 
     # 4c. Subjects that reached a terminal state since the last synthesis.
@@ -962,6 +1076,21 @@ async def _resynthesize_space(
     try:
         folded_snapshot = current_snapshot
         result_sections: list[dict] = []
+        # Live high-priority subjects the snapshot has lost track of. Offered only when the
+        # previous snapshot left the attention section empty — the condition the block's own
+        # framing states, checked here as well so a non-starved run does not pay for the
+        # query — and never for a subject that snapshot already accounts for, since the block
+        # says its entries are "NOT in the snapshot above". Fetched once, because the
+        # candidate list is the same for every fold of one resynthesis, and offered on the
+        # first fold only — the same argument as the prune hints below: after the first fold
+        # the model has already decided what belongs in the attention section, and repeating
+        # the block costs window on every later chunk for nothing.
+        if needs_open_items(current_snapshot):
+            open_items, open_items_total = await _fetch_open_items(
+                db, space_id, _snapshot_entity_ids(current_snapshot, snapshot_meta),
+            )
+        else:
+            open_items, open_items_total = [], 0
         for idx, chunk in enumerate(chunks):
             first = idx == 0
             chunk_acted = [
@@ -980,6 +1109,8 @@ async def _resynthesize_space(
                 # snapshot — apply them once, on the first fold.
                 item_states=item_states if first else [],
                 resolved_cards=resolved_cards if first else [],
+                open_items=open_items if first else [],
+                open_items_total=open_items_total if first else 0,
             )
             response = await llm_call(
                 role="omni",

@@ -207,6 +207,30 @@ def _density_instructions(density: str) -> str:
     )
 
 
+def needs_open_items(current_snapshot: dict[str, Any] | None) -> bool:
+    """True when the request should carry the open-items candidate block at all.
+
+    The block exists to repair a starved attention section. Attention is carried forward,
+    so a snapshot whose attention section is empty gives the model nothing to carry and the
+    section stays empty while the cards under it are open. Two conditions therefore have to
+    hold — and they are checked here, next to the sentence the block opens with, so the two
+    cannot drift apart:
+
+    * there IS a prior snapshot. On a first synthesis the model is already given every one of
+      those subjects in [NEW CARDS SINCE LAST SYNTHESIS], so the block would restate them at
+      the cost of window.
+    * that snapshot's attention section is empty. Nothing is starved while the snapshot still
+      carries attention items forward, and re-offering subjects the model has already placed
+      is how a de-escalation gets re-litigated.
+    """
+    if not current_snapshot:
+        return False
+    for section in current_snapshot.get("sections", []) or []:
+        if section.get("type") == "attention" and section.get("items"):
+            return False
+    return True
+
+
 def build_omni_resynthesis_messages(
     current_snapshot: dict[str, Any] | None,
     new_cards: list[dict[str, Any]],
@@ -216,6 +240,8 @@ def build_omni_resynthesis_messages(
     space_id: str = "default",
     item_states: list[dict[str, Any]] | None = None,
     resolved_cards: list[dict[str, Any]] | None = None,
+    open_items: list[dict[str, Any]] | None = None,
+    open_items_total: int = 0,
 ) -> list[dict[str, str]]:
     """Build messages for a full Omni resynthesis.
 
@@ -224,6 +250,16 @@ def build_omni_resynthesis_messages(
         live_max_priority}.
     resolved_cards: subjects that reached a terminal state since the last synthesis.
         Each entry: {entity_id, header, status}.
+    open_items: live high-priority subjects the snapshot has lost track of, offered as
+        attention CANDIDATES. Rendered only when `needs_open_items(current_snapshot)` holds —
+        a prior snapshot whose attention section is empty — and the caller is expected to have
+        dropped every subject that snapshot already accounts for, in ANY section, because the
+        block's opening sentence tells the model these subjects are "NOT in the snapshot
+        above". The model decides whether any belongs in the section; nothing here is written
+        into the output. Each entry: {entity_id, header, priority, status, open_cards,
+        last_active}.
+    open_items_total: how many matching subjects exist after that exclusion and before the
+        cap, so the block can say whether the model is seeing all of them or a window.
     """
 
     # Current snapshot
@@ -273,6 +309,37 @@ def build_omni_resynthesis_messages(
             )
         resolved_text += "[END RESOLVED]\n"
 
+    # Live high-priority subjects the snapshot has lost track of. Offered as CANDIDATES,
+    # never injected: the model decides what, if anything, belongs in the attention section,
+    # and a run that ignores this block behaves exactly as it did before. The framing is in
+    # the block itself so it travels with the data rather than depending on the reader having
+    # found the instruction elsewhere in a long system prompt. `needs_open_items` is the same
+    # condition the block's second sentence states, so the emitted block cannot claim
+    # something the request does not show.
+    open_text = ""
+    if open_items and needs_open_items(current_snapshot):
+        shown = len(open_items)
+        total = max(open_items_total or shown, shown)
+        open_text = "\n[OPEN ITEMS THAT MAY NEED ATTENTION — CANDIDATES, NOT ATTENTION]\n"
+        open_text += (
+            "Live, high-priority subjects in this space that are NOT in the snapshot above. "
+            "The snapshot's attention section is empty, and attention is carried forward, so "
+            "those subjects cannot come back on their own. Treat them as candidates you may "
+            "draw on: decide from the evidence whether any of them belongs in the attention "
+            "section, and do NOT add one merely because it is listed here. "
+            f"{total} open subject(s) in total; "
+        )
+        open_text += ("all of them are listed below.\n" if shown >= total
+                      else f"the {shown} most recently active are listed below.\n")
+        for item in open_items:
+            open_text += (
+                f"- [{item.get('priority', '?')}] {item.get('header', 'Untitled')} "
+                f"(entity: {item.get('entity_id', '?')}, status: {item.get('status', '?')}, "
+                f"{item.get('open_cards', 1)} open card(s), "
+                f"last active: {item.get('last_active', '?')})\n"
+            )
+        open_text += "[END OPEN ITEMS]\n"
+
     # User-acted cards (higher weight)
     acted_text = ""
     if acted_cards:
@@ -298,6 +365,7 @@ def build_omni_resynthesis_messages(
     user_message = (
         f"Synthesize the Omni summary for space '{space_id}'.\n"
         f"{snapshot_text}\n"
+        f"{open_text}"
         f"{state_text}"
         f"{resolved_text}"
         f"{cards_text}"
