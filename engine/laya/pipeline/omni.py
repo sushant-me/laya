@@ -684,6 +684,121 @@ def _all_resolved(card_ids: list[str], meta: dict[str, dict]) -> bool:
     return all(m.get("status") in _TERMINAL_STATUSES for m in known)
 
 
+# A subject only belongs in `attention` while it is urgent. The prompt tells the
+# model to move anything whose live priority has dropped below HIGH out of the
+# section (R3), so those are exactly the priorities that must not count as a wipe.
+_ATTENTION_PRIORITIES = {"CRITICAL", "HIGH"}
+
+
+def _open_max_priority(card_ids: list[str], meta: dict[str, dict]) -> str | None:
+    """Highest priority among source cards that are still OPEN and actionable.
+
+    Two differences from `_live_max_priority`, both needed by the wipe guard and
+    neither appropriate to its other caller (the de-escalation hint the prompt is
+    built from, which must keep describing every subject it can see):
+
+    * `failed` counts as not-live here. It is inactive without being terminal — it
+      sets no `resolved_at` — so the looser "not resolved" reading would call a dead
+      card live and keep the guard rejecting a perfectly good synthesis. This asks
+      the lifecycle module's own question instead of re-deriving the status list.
+    * It is a separate function rather than a flag on `_live_max_priority` so that
+      the two halves of this change (#10) stay textually independent: the sibling
+      branch inserts its snapshot helper immediately above that function.
+    """
+    # Imported here rather than at module scope for the same independence reason;
+    # `is_active` is the single source of truth for "still actionable".
+    from laya.models.card_lifecycle import is_active
+
+    best: str | None = None
+    best_rank = 99
+    for cid in card_ids:
+        m = meta.get(cid)
+        if not m or m.get("status") in _TERMINAL_STATUSES:
+            continue
+        if not is_active(m.get("status", "")):
+            continue
+        rank = _PRIORITY_ORDER.get(m.get("priority", "MEDIUM"), 2)
+        if rank < best_rank:
+            best_rank = rank
+            best = m.get("priority", "MEDIUM")
+    return best
+
+
+def _item_identity(item: dict) -> tuple[set[str], set[str]]:
+    """The (entity_ids, source_cards) a subject can be recognised by."""
+    return set(item.get("entity_ids") or []), set(_item_source_cards(item))
+
+
+def _subject_survives(prior_item: dict, result_sections: list[dict]) -> bool:
+    """True when the result still represents this prior subject SOMEWHERE.
+
+    Attention is not a subject's only home: the prompt explicitly asks for a
+    de-escalated item to be moved into recent/period (R3/R4) and for an aggregate
+    to be rebuilt without a resolved member (R2). Matching on either identity axis
+    is deliberate — a regrouped aggregate may keep the entities but drop the
+    individual card, or keep a card but relabel its entity.
+    """
+    prior_entities, prior_cards = _item_identity(prior_item)
+    if not prior_entities and not prior_cards:
+        return False  # nothing to match on, so it cannot be shown to have survived
+    for section in result_sections:
+        for item in section.get("items", []) or []:
+            entities, cards = _item_identity(item)
+            if prior_entities and prior_entities & entities:
+                return True
+            if prior_cards and prior_cards & cards:
+                return True
+    return False
+
+
+def _attention_wipe_count(
+    carried_sections: list[dict],
+    result_sections: list[dict],
+    meta: dict[str, dict],
+) -> int:
+    """How many OPEN, URGENT attention items a result dropped outright.
+
+    The all-empty guard in `_resynthesize_space` sums items across EVERY section, so a
+    result that empties `attention` while leaving `recent` populated passes it, is stored,
+    and — because a resynthesis carries the previous snapshot forward — feeds its own empty
+    attention into every later run. The `...`-skeleton guard cannot see it either:
+    `_is_degenerate_sections` returns False when there are no items at all, deliberately,
+    because it targets placeholder text.
+
+    Not every empty attention is a wipe, and the first version of this guard got that
+    wrong: it counted any carried item whose cards were merely non-terminal, so it
+    rejected results the prompt explicitly ORDERS — de-escalation moving a subject whose
+    live priority fell below HIGH out of attention (R3), completion surfacing in
+    recent/period instead of vanishing (R4), an aggregate rebuilt without a resolved
+    member (R2). A rejection advances nothing (`since` is not advanced), so the scheduler
+    recomputed the same satisfied trigger and retried the identical run indefinitely.
+
+    So an item counts only when BOTH hold:
+      - it survives NOWHERE in the result — not in any section, matched on entity_ids or
+        source_cards (`_subject_survives`), because a subject that moved or was regrouped
+        was not dropped; and
+      - its source cards are still open AND urgent — `is_active` excludes `failed`
+        (inactive though not terminal, since it sets no resolved_at), and only
+        CRITICAL/HIGH counts, because anything lower is precisely what R3 removes.
+
+    Zero therefore means the emptiness is explained, or whatever left was neither open nor
+    urgent, and the result may be stored.
+    """
+    if any(s.get("type") == "attention" and s.get("items") for s in result_sections):
+        return 0  # the section is not empty, so there is nothing to explain
+    dropped = 0
+    for section in carried_sections:
+        if section.get("type") != "attention":
+            continue
+        for item in section.get("items", []) or []:
+            if _subject_survives(item, result_sections):
+                continue  # moved (R3/R4) or regrouped (R2) — not dropped
+            priority = _open_max_priority(_item_source_cards(item), meta)
+            if priority in _ATTENTION_PRIORITIES:
+                dropped += 1
+    return dropped
+
+
 async def run_omni_resynthesis(
     space_id: str | None = None,
     snapshot_type: str = "scheduled",
@@ -770,6 +885,15 @@ async def _resynthesize_space(
             space_id=space_id, version=current_version,
         )
         current_snapshot = None
+
+    # What the wipe guard below is allowed to judge against: the sections the MODEL
+    # was actually shown. A discarded degenerate snapshot is shown to nobody (it is
+    # rebuilt from scratch), yet `prior_sections` still holds its items — carrying the
+    # source_cards of whatever the poison replaced. Judging the repair against those
+    # would reject the one synthesis that clears the '...', pinning the space to the
+    # poisoned snapshot permanently. Note this deliberately does NOT narrow the change
+    # summary, which must diff against what the user was looking at.
+    guard_baseline = prior_sections if current_snapshot is not None else []
 
     # 2. Load pinned items
     pin_rows = await db.execute_fetchall(
@@ -1093,6 +1217,26 @@ async def _resynthesize_space(
 
     if pruned_attention:
         log.info("omni_attention_pruned", space_id=space_id, dropped=pruned_attention)
+
+    # 7b-bis. The empty-result guard above cannot see this one: it sums items across every
+    # section, so a result that empties `attention` while leaving `recent` populated passes
+    # it and is stored. Because resynthesis carries the previous snapshot forward, the empty
+    # attention then feeds itself into every later run — the model is shown an empty
+    # attention section and returns one, which is why the section can stay empty for months
+    # while the underlying cards are still open. The prune just above is one way a genuinely
+    # empty attention becomes legitimate (every subject resolved); `_attention_wipe_count`
+    # documents the others (a subject moved into another section, one no longer open or no
+    # longer CRITICAL/HIGH). It is judged against `guard_baseline`, the sections the model
+    # saw. Same contract as the empty-result guard: the last good snapshot stays and `since`
+    # is not advanced, so nothing is lost.
+    wiped = _attention_wipe_count(guard_baseline, result_sections, out_meta)
+    if wiped:
+        log.warning(
+            "omni_resynthesis_attention_wiped", space_id=space_id, dropped=wiped,
+        )
+        gate.set()
+        log.info("omni_resynthesis_gate_opened", space_id=space_id, reason="attention_wiped")
+        return None
 
     # 7c. Stamp item keys, then diff this result against what the user was
     # looking at. Order matters: keys are computed from the FINAL entity_ids

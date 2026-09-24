@@ -934,3 +934,239 @@ class TestEmptyResultGuard:
         att = [it for s in content["sections"] if s.get("type") == "attention"
                for it in s.get("items", [])]
         assert att == []  # resolved subject pruned, snapshot stored anyway
+
+
+@pytest.mark.asyncio
+class TestAttentionWipeGuard:
+    """The empty-result guard sums items across EVERY section, so a result that
+    empties `attention` while leaving `recent` populated slips through it. Stored,
+    that empty attention is carried forward and shown to the model on the next run,
+    which returns an empty one again — the section stays empty while the cards under
+    it are still open. The prune just above the new guard is what makes a genuinely
+    empty attention legitimate (every subject resolved), so the guard has to be able
+    to tell the two apart, and these tests pin both directions.
+
+    The first version of the guard only knew that one distinction, and counted any
+    carried item whose cards were not terminal — which also covers three moves the
+    omni prompt explicitly ORDERS (R2/R3/R4: a de-escalated subject moved to
+    recent/period, a completed one surfaced as progress, an aggregate rebuilt
+    without a resolved member). Rejecting those stalls a space permanently: nothing
+    is stored, `since` is not advanced, and the scheduler recomputes the same
+    satisfied trigger next run. So the "legitimate empty" direction has four cases,
+    and every one of them is pinned below."""
+
+    async def _prior_with_attention(self, db, status, card_id="card_old",
+                                    card_priority="HIGH", item_text="PR #9 awaiting your review"):
+        """A stored snapshot whose attention holds one item, and its source card."""
+        from tests.conftest import insert_test_card
+
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        if status is not None:
+            await insert_test_card(db, card_id=card_id, event_id="evt_old", space_id="default")
+            await db.execute("UPDATE action_cards SET status = ?, priority = ? WHERE card_id = ?",
+                             (status, card_priority, card_id))
+            await db.commit()
+        content = {"sections": [
+            {"type": "attention", "label": None, "items": [
+                {"text": item_text, "source_cards": [card_id],
+                 "entity_ids": ["github:pull_request:org/repo/#9"], "platforms": ["github"],
+                 "priority": "HIGH", "pinned": False}]},
+            {"type": "recent", "label": None, "items": []},
+            {"type": "period", "label": None, "items": []},
+            {"type": "milestone", "label": None, "items": []},
+        ]}
+        await db.execute(
+            """INSERT INTO omni_snapshots
+               (snapshot_id, space_id, version, generated_at, snapshot_type,
+                content_json, card_ids, events_processed, created_at, is_delta, base_version)
+               VALUES ('omni_seed_1', 'default', 1, ?, 'rolling', ?, ?, 1, ?, 0, NULL)""",
+            (since, json.dumps(content), json.dumps([card_id]), since),
+        )
+        await db.commit()
+
+
+    async def _fresh_card(self, db):
+        """A new card, so resynthesis is not skipped for having nothing to do."""
+        from tests.conftest import insert_test_card
+
+        now = datetime.now(timezone.utc)
+        await insert_test_card(db, card_id="card_fresh", event_id="evt_fresh", space_id="default")
+        await db.execute("UPDATE action_cards SET created_at = ? WHERE card_id = ?",
+                         ((now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"), "card_fresh"))
+        await db.commit()
+
+    def _wiped_sections(self):
+        """attention empty, recent populated — the shape that got stored."""
+        return [
+            {"type": "attention", "label": None, "items": []},
+            {"type": "recent", "label": None, "items": [
+                {"text": "Fresh real item", "source_cards": ["card_fresh"],
+                 "entity_ids": ["github:issue:org/repo/#1"], "platforms": ["github"],
+                 "priority": "MEDIUM", "pinned": False}]},
+            {"type": "period", "label": None, "items": []},
+            {"type": "milestone", "label": None, "items": []},
+        ]
+
+    async def _run(self, db, sections=None):
+        from laya.pipeline import omni as omni_pipeline
+
+        omni_pipeline._latest_cache.pop("default", None)
+        sections = self._wiped_sections() if sections is None else sections
+
+        async def fake_llm(**kwargs):
+            class R:
+                parsed = {"sections": sections}
+                truncated = False
+                output_tokens = 10
+                model = "test"
+            return R()
+
+        with patch.object(omni_pipeline, "llm_call", new=fake_llm):
+            return await omni_pipeline._resynthesize_space(
+                db, "default", density="compact", snapshot_type="manual", event_threshold=50)
+
+    async def _snapshot_count(self, db):
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) AS n FROM omni_snapshots WHERE space_id = 'default'", ())
+        return rows[0]["n"]
+
+    async def test_wiping_attention_with_a_live_item_is_not_stored(self, db):
+        """The reported shape: the model returns no attention while a carried,
+        still-open subject sits in it. Nothing is persisted, so the good snapshot
+        survives and next run still has an attention section to work from."""
+        await self._prior_with_attention(db, status="pending")
+        await self._fresh_card(db)
+        assert await self._snapshot_count(db) == 1
+
+        result = await self._run(db)
+
+        assert result is None
+        assert await self._snapshot_count(db) == 1  # the wipe never hit the DB
+
+    async def test_an_empty_attention_with_every_subject_resolved_is_still_stored(self, db):
+        """The other direction, and the reason the guard is not "attention == [] is
+        an error": once the carried subject is terminal the empty section is
+        correct, and rejecting it would stall resynthesis for that space."""
+        await self._prior_with_attention(db, status="done")
+        await self._fresh_card(db)
+
+        result = await self._run(db)
+
+        assert result is not None
+        assert await self._snapshot_count(db) == 2  # the legitimate empty was stored
+
+    async def test_a_carried_item_whose_cards_are_gone_does_not_block_synthesis(self, db):
+        """Same reasoning one step further out: a source card that no longer exists
+        cannot be shown to be live, so it must not keep the guard firing forever."""
+        await self._prior_with_attention(db, status=None)  # never inserted
+        await self._fresh_card(db)
+
+        result = await self._run(db)
+
+        assert result is not None
+        assert await self._snapshot_count(db) == 2
+
+    def _de_escalated_sections(self):
+        """R3-compliant: attention emptied, the SAME subject moved into recent."""
+        return [
+            {"type": "attention", "label": None, "items": []},
+            {"type": "recent", "label": None, "items": [
+                {"text": "PR #9 de-escalated to low priority",
+                 "source_cards": ["card_old"],
+                 "entity_ids": ["github:pull_request:org/repo/#9"], "platforms": ["github"],
+                 "priority": "LOW", "pinned": False},
+                {"text": "Fresh real item", "source_cards": ["card_fresh"],
+                 "entity_ids": ["github:issue:org/repo/#1"], "platforms": ["github"],
+                 "priority": "MEDIUM", "pinned": False}]},
+            {"type": "period", "label": None, "items": []},
+            {"type": "milestone", "label": None, "items": []},
+        ]
+
+    async def test_a_de_escalated_subject_is_not_a_wipe(self, db):
+        """The prompt ORDERS this move (R3: "if a prior-snapshot item's highest live
+        priority has dropped below HIGH ... move it into recent/period"). An
+        over-broad guard rejects the instruction it was given, and then never stops
+        rejecting it: `since` is not advanced, so the same run repeats."""
+        await self._prior_with_attention(db, status="pending", card_priority="LOW")
+        await self._fresh_card(db)
+
+        result = await self._run(db, self._de_escalated_sections())
+
+        assert result is not None
+        assert await self._snapshot_count(db) == 2
+
+    async def test_a_subject_moved_to_another_section_is_not_a_wipe(self, db):
+        """The same shape with the priority hinge removed: the subject is STILL
+        HIGH, it simply moved. Nothing was dropped, so nothing was wiped — the
+        question the guard asks is "did this leave the board?", not "did this leave
+        the attention section?"."""
+        await self._prior_with_attention(db, status="pending", card_priority="HIGH")
+        await self._fresh_card(db)
+        moved = self._de_escalated_sections()
+        moved[1]["items"][0]["priority"] = "HIGH"
+        moved[1]["items"][0]["text"] = "PR #9 still needs review, tracked in recent"
+
+        result = await self._run(db, moved)
+
+        assert result is not None
+        assert await self._snapshot_count(db) == 2
+
+    async def test_a_failed_card_does_not_keep_the_guard_firing(self, db):
+        """`failed` is inactive but NOT terminal (it sets no resolved_at), so a
+        status check against TERMINAL_STATUSES alone reads a dead card as live. The
+        guard asks the lifecycle module's own question instead — is_active — which
+        is the same reading the open-items query uses."""
+        await self._prior_with_attention(db, status="failed", card_priority="CRITICAL")
+        await self._fresh_card(db)
+
+        result = await self._run(db)
+
+        assert result is not None
+        assert await self._snapshot_count(db) == 2
+
+    async def test_the_repair_of_a_poisoned_snapshot_is_not_rejected(self, db):
+        """A degenerate '...' base is discarded before the LLM call, so the model is
+        shown NO prior snapshot — a spy on the builder pins that. The wipe guard must
+        then judge against what the model saw, not against the poisoned copy it never
+        received: those items still carry live source_cards, so an over-broad guard
+        rejects the very synthesis that clears the '...' and the space stays poisoned
+        for good."""
+        from laya.pipeline import omni as omni_pipeline
+
+        await self._prior_with_attention(db, status="pending", item_text="...")
+        await self._fresh_card(db)
+
+        omni_pipeline._latest_cache.pop("default", None)
+        seen_snapshots = []
+        real_build = omni_pipeline.build_omni_resynthesis_messages
+
+        def spy_build(**kwargs):
+            seen_snapshots.append(kwargs["current_snapshot"])
+            return real_build(**kwargs)
+
+        sections = self._wiped_sections()
+
+        async def fake_llm(**kwargs):
+            class R:
+                parsed = {"sections": sections}
+                truncated = False
+                output_tokens = 10
+                model = "test"
+            return R()
+
+        with patch.object(omni_pipeline, "build_omni_resynthesis_messages", new=spy_build), \
+             patch.object(omni_pipeline, "llm_call", new=fake_llm):
+            result = await omni_pipeline._resynthesize_space(
+                db, "default", density="compact", snapshot_type="manual", event_threshold=50)
+
+        assert seen_snapshots and seen_snapshots[0] is None  # poison withheld from the model
+        assert result is not None
+        rows = await db.execute_fetchall(
+            """SELECT content_json FROM omni_snapshots
+               WHERE space_id = 'default' AND is_delta = 0
+               ORDER BY version DESC LIMIT 1""", ())
+        latest = json.loads(rows[0]["content_json"])
+        texts = [it["text"] for s in latest["sections"] for it in s.get("items", [])]
+        assert "..." not in texts  # the poisoned snapshot is no longer the latest
+
